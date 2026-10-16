@@ -1,0 +1,12 @@
+# Shared Rust libraries for the Method Production Suite apps. Each library is one
+# crate under crates/; apps depend on them by git tag. No crates yet: the first is
+# `method-update` (from Method Reader's sp-update), see README.md.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/method-production-suite/method-libs"

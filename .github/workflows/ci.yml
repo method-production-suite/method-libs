@@ -1,0 +1,85 @@
+# Least privilege by default. Every action pinned to a full commit SHA, the same pins
+# as the other Method repos (SUITE-STANDARDS.md: checkout v7.0.1).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  rust:
+    # fmt, clippy and tests on every desktop OS the apps ship on. Until the first
+    # crate lands, Cargo has nothing to build, so the Rust steps are skipped.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Any crates yet?
+        id: crates
+        shell: bash
+        run: |
+          if compgen -G "crates/*/Cargo.toml" > /dev/null; then echo "any=true" >> "$GITHUB_OUTPUT"; else echo "any=false" >> "$GITHUB_OUTPUT"; echo "No crates yet: nothing to build."; fi
+      - name: Format
+        if: steps.crates.outputs.any == 'true'
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        if: steps.crates.outputs.any == 'true'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        if: steps.crates.outputs.any == 'true'
+        run: cargo test --workspace --locked
+  cooldown:
+    # Fails a change that adds crates published less than 14 days ago (Method Budget's
+    # check, scripts/check-crate-ages.py).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check crate ages
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            base=origin/main
+          elif [ -n "${BEFORE:-}" ] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            base="$BEFORE"
+          else
+            base=""
+          fi
+          if [ -n "$base" ]; then
+            python3 scripts/check-crate-ages.py --lock Cargo.lock --only-changed "$base"
+          else
+            python3 scripts/check-crate-ages.py --lock Cargo.lock
+          fi
+  deny:
+    # deny.toml: known advisories, licenses compatible with MIT OR Apache-2.0,
+    # crates.io as the only source. Skipped until the first crate lands.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Any crates yet?
+        id: crates
+        run: |
+          if compgen -G "crates/*/Cargo.toml" > /dev/null; then echo "any=true" >> "$GITHUB_OUTPUT"; else echo "any=false" >> "$GITHUB_OUTPUT"; fi
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        if: steps.crates.outputs.any == 'true'
+        with:
+          command: check
