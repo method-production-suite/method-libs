@@ -1,7 +1,8 @@
 //! Atomic file writes for the updater's settings: the new contents go to a
 //! fresh file beside the target, are flushed to disk, then renamed over it.
 //! A crash or a full disk leaves the old file or the new one, never half
-//! of one.
+//! of one. On unix the file is readable and writable by its owner only
+//! (0600), as each app's own settings file was before it used this crate.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -25,10 +26,11 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()>
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let written = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut f = options.open(&temp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
@@ -63,6 +65,18 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["updates.json"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("updates.json");
+        write_atomically(&file, b"one").unwrap();
+        write_atomically(&file, b"two").unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
