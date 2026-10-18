@@ -98,10 +98,21 @@ impl Default for Settings {
 impl Settings {
     /// Reads `file`; missing or unreadable means the defaults.
     pub fn load(file: &Path) -> Settings {
-        std::fs::read_to_string(file)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+        Self::read(file).ok().flatten().unwrap_or_default()
+    }
+
+    /// Reads `file`: `Ok(None)` when there is none yet, `Err` when it is
+    /// there but can't be read or parsed. Such a file may hold a "no" this
+    /// build can't see, so [`Updater`] never writes over it on its own.
+    pub fn read(file: &Path) -> Result<Option<Settings>, String> {
+        let text = match std::fs::read_to_string(file) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("{}: {e}", file.display())),
+        };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| format!("{}: {e}", file.display()))
     }
 
     /// Writes `file` atomically, making its folder if needed.
@@ -338,6 +349,9 @@ pub struct Updater {
     unavailable: Option<String>,
     settings_file: Option<PathBuf>,
     settings: Mutex<Settings>,
+    /// False while the settings file is one this build couldn't read: then
+    /// nothing is written over it except the person's own choice.
+    may_write: Mutex<bool>,
     machine: Mutex<Machine>,
     pending: Mutex<Option<(Update, Vec<u8>)>>,
     schedule: Mutex<Schedule>,
@@ -357,14 +371,13 @@ impl Updater {
         settings_file: Option<PathBuf>,
         launched: Instant,
     ) -> Self {
-        let mut settings = settings_file
-            .as_deref()
-            .map(Settings::load)
-            .unwrap_or_default();
+        let read = settings_file.as_deref().map(Settings::read);
+        let may_write = !matches!(read, Some(Err(_)));
+        let mut settings = read.and_then(|r| r.ok().flatten()).unwrap_or_default();
         let (due, remember) = whats_new_due(settings.seen.as_deref(), current);
         if let Some(v) = remember {
             settings.seen = Some(v);
-            if let Some(f) = &settings_file {
+            if let (Some(f), true) = (&settings_file, may_write) {
                 let _ = settings.save(f);
             }
         }
@@ -381,6 +394,7 @@ impl Updater {
             unavailable,
             settings_file,
             settings: Mutex::new(settings),
+            may_write: Mutex::new(may_write),
             machine: Mutex::new(Machine::default()),
             pending: Mutex::new(None),
             schedule: Mutex::new(Schedule::starting(launched)),
@@ -408,13 +422,26 @@ impl Updater {
         lock(&self.settings).automatic
     }
 
-    /// Turns automatic checks on or off, and keeps the choice.
+    /// Turns automatic checks on or off, and keeps the choice: the
+    /// person's own choice is written even over a file this build couldn't
+    /// read, since it is what they want now.
     pub fn set_automatic(&self, on: bool) -> std::io::Result<()> {
         let mut s = lock(&self.settings);
         s.automatic = on;
         match &self.settings_file {
-            Some(f) => s.save(f),
+            Some(f) => {
+                s.save(f)?;
+                *lock(&self.may_write) = true;
+                Ok(())
+            }
             None => Ok(()),
+        }
+    }
+
+    /// Writes the settings, unless the file is one this build couldn't read.
+    fn persist(&self, s: &Settings) {
+        if let (Some(f), true) = (&self.settings_file, *lock(&self.may_write)) {
+            let _ = s.save(f);
         }
     }
 
@@ -534,9 +561,7 @@ impl Updater {
         if due {
             let mut s = lock(&self.settings);
             s.seen = Some(self.current.clone());
-            if let Some(f) = &self.settings_file {
-                let _ = s.save(f);
-            }
+            self.persist(&s);
         }
         due
     }
@@ -688,6 +713,30 @@ mod tests {
         };
         off.save(&file).unwrap();
         assert_eq!(Settings::load(&file), off);
+    }
+
+    #[test]
+    fn an_unreadable_settings_file_is_never_written_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("updates.json");
+        // A stored "no" this build can't read (written by a later version,
+        // or damaged): the default applies for this run only.
+        std::fs::write(&file, "{\"automatic\": false, ").unwrap();
+        assert!(Settings::read(&file).is_err());
+        assert_eq!(Settings::read(&dir.path().join("none.json")).unwrap(), None);
+        let u = Updater::new(app(&key()), "1.0.0", Some(file.clone()), Instant::now());
+        assert!(u.automatic(), "the default, in memory");
+        u.check_with(false, || Ok(None), |_| unreachable!());
+        u.check_with(true, || Err("offline".into()), |_| unreachable!());
+        u.take_whats_new();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "{\"automatic\": false, ",
+            "kept as it was"
+        );
+        // Only the person's own choice is written.
+        u.set_automatic(false).unwrap();
+        assert!(!Settings::load(&file).automatic);
     }
 
     #[test]
