@@ -12,8 +12,9 @@ concurrency:
   cancel-in-progress: true
 jobs:
   rust:
-    # fmt, clippy and tests on every desktop OS the apps ship on. Until the first
-    # crate lands, Cargo has nothing to build, so the Rust steps are skipped.
+    # fmt, clippy and tests on every desktop OS the apps ship on. The Rust steps
+    # run whenever crates/*/Cargo.toml exists (crates/method-update does); with no
+    # crates Cargo would have nothing to build, so they are skipped.
     strategy:
       fail-fast: false
       matrix:
@@ -68,7 +69,7 @@ jobs:
           fi
   deny:
     # deny.toml: known advisories, licenses compatible with MIT OR Apache-2.0,
-    # crates.io as the only source. Skipped until the first crate lands.
+    # crates.io as the only source. Skipped only when there are no crates.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
