@@ -4,7 +4,22 @@
 [advisories]
 # Every advisory fails, unmaintained and unsound ones included, unless it is
 # listed here with the reason it does not apply.
-ignore = []
+#
+# The four below are fixed in rustls 0.23.46, published 2026-10-14: too new for
+# the 14-day cooldown (scripts/check-crate-ages.py) until 2026-10-28. Until then
+# the lock keeps 0.23.45; on or after that date, `cargo update -p rustls
+# --precise 0.23.46` and delete these four lines. None of them reaches the
+# updater, which is ureq with rustls on the ring provider and nothing else:
+ignore = [
+    # Debug impls of client session values: nothing here formats them.
+    { id = "RUSTSEC-2026-0346", reason = "no Debug formatting of rustls session values; bump to 0.23.46 on 2026-10-28" },
+    # ECH rejection: ureq never turns Encrypted Client Hello on.
+    { id = "RUSTSEC-2026-0347", reason = "ECH is not enabled by ureq; bump to 0.23.46 on 2026-10-28" },
+    # Brotli certificate decompression: the brotli feature is off.
+    { id = "RUSTSEC-2026-0348", reason = "rustls brotli feature not enabled; bump to 0.23.46 on 2026-10-28" },
+    # Post-quantum downgrade: the ring provider offers classical groups only.
+    { id = "RUSTSEC-2026-0349", reason = "ring provider has no post-quantum groups to downgrade from; bump to 0.23.46 on 2026-10-28" },
+]
 
 [licenses]
 # Everything we ship must be compatible with distributing the suite libraries under

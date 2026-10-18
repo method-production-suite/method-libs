@@ -1,6 +1,5 @@
 # Shared Rust libraries for the Method Production Suite apps. Each library is one
-# crate under crates/; apps depend on them by git tag. No crates yet: the first is
-# `method-update` (from Method Reader's sp-update), see README.md.
+# crate under crates/; apps depend on them by git tag. See README.md for the list.
 [workspace]
 resolver = "3"
 members = ["crates/*"]
@@ -10,3 +9,21 @@ edition = "2024"
 rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/method-production-suite/method-libs"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# Every dependency pinned to the exact version that passed the 14-day age check
+# (scripts/check-crate-ages.py) and cargo deny. A bump is a deliberate change.
+[workspace.dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+semver = "=1.0.28"
+minisign-verify = "=0.2.5"
+base64 = "=0.23.1"
+ureq = "=3.4.2"
+flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"] }
+tar = { version = "=0.4.46", default-features = false }
+plist = "=1.10.1"
+minisign = "=0.7.3"
+tempfile = "=3.27.0"
