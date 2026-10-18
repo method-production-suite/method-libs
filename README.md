@@ -3,14 +3,17 @@
 Shared Rust libraries for the Method Production Suite apps (Method Storyteller, Method
 Reader, Method Schedule and Method Budget), in the spirit of ArtCraft's `craft-libs`.
 
-Empty for now. Planned, in order:
+## Crates
 
-1. `method-update`: the suite's updater for apps that don't use Tauri's (Method Reader
-   and Method Storyteller). It grows out of Method Reader's `sp-update`: Tauri's
-   `latest.json` format, minisign signatures, checks 2 minutes after launch and every 6
-   hours, with a switch to turn checking off. See the suite's update standard.
-2. The PDF-to-script crates (model, PDF reading, parsing, Fountain and .fdx output) from
-   Method Reader, shared with Method Storyteller's Import PDF and Method Schedule.
+- [`method-update`](crates/method-update/README.md): the suite's updater. Tauri's
+  `latest.json` format, minisign signatures, the Mac bundle swap and restart, and the
+  suite's update behaviour: checks 2 minutes after launch and every 6 hours, with a switch
+  to turn checking off. It grew out of Method Reader's `sp-update`, and any app can use
+  it, whatever its UI framework.
+
+Planned next: the PDF-to-script crates (model, PDF reading, parsing, Fountain and .fdx
+output) from Method Reader, shared with Method Storyteller's Import PDF and Method
+Schedule.
 
 ## Rules
 

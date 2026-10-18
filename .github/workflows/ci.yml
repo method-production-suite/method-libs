@@ -12,8 +12,9 @@ concurrency:
   cancel-in-progress: true
 jobs:
   rust:
-    # fmt, clippy and tests on every desktop OS the apps ship on. Until the first
-    # crate lands, Cargo has nothing to build, so the Rust steps are skipped.
+    # fmt, clippy and tests on every desktop OS the apps ship on. The Rust steps
+    # run whenever crates/*/Cargo.toml exists (crates/method-update does); with no
+    # crates Cargo would have nothing to build, so they are skipped.
     strategy:
       fail-fast: false
       matrix:
@@ -68,7 +69,7 @@ jobs:
           fi
   deny:
     # deny.toml: known advisories, licenses compatible with MIT OR Apache-2.0,
-    # crates.io as the only source. Skipped until the first crate lands.
+    # crates.io as the only source. Skipped only when there are no crates.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -79,6 +80,10 @@ jobs:
         id: crates
         run: |
           if compgen -G "crates/*/Cargo.toml" > /dev/null; then echo "any=true" >> "$GITHUB_OUTPUT"; else echo "any=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Temporary advisory ignores not expired
+        # deny.toml's `# ignore-expires:` date; fails once it has passed while
+        # the ignores it covers are still listed.
+        run: python3 scripts/check-ignore-expiry.py
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         if: steps.crates.outputs.any == 'true'
         with:
