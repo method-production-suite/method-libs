@@ -11,7 +11,7 @@
 mod common;
 
 use common::{make_bundle, names};
-use method_update::install::{Swept, sweep_at_startup_stamped, sweep_beside, sweep_beside_stamped};
+use method_update::install::{Swept, sweep_at_startup_stamped, sweep_beside_stamped};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -417,7 +417,9 @@ fn a_backup_renamed_just_now_is_fresh_however_old_its_mtime() {
     let mtime = std::fs::metadata(&backup).unwrap().modified().unwrap();
     assert!(SystemTime::now().duration_since(mtime).unwrap() > Duration::from_secs(3600));
 
-    let swept = sweep_beside(apps.path(), "Method Example.app", &names(), ME, None);
+    // The real clock: no stamp given.
+    let swept =
+        method_update::install::sweep_beside(apps.path(), "Method Example.app", &names(), ME, None);
     assert_eq!(swept, Swept::default());
     assert!(backup.exists(), "renamed seconds ago: kept");
 }
