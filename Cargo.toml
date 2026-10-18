@@ -13,17 +13,19 @@ repository = "https://github.com/method-production-suite/method-libs"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
-# Every dependency pinned to the exact version that passed the 14-day age check
-# (scripts/check-crate-ages.py) and cargo deny. A bump is a deliberate change.
+# Caret ranges, so an app that uses these libraries isn't held to their versions: each
+# app's own Cargo.lock, crate-age check and cargo deny decide what it builds with. The
+# minimums here are the versions this repository's Cargo.lock passed the 14-day age check
+# (scripts/check-crate-ages.py) and cargo deny with; that lock stays the record.
 [workspace.dependencies]
-serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
-semver = "=1.0.28"
-minisign-verify = "=0.2.5"
-base64 = "=0.23.1"
-ureq = "=3.4.2"
-flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"] }
-tar = { version = "=0.4.46", default-features = false }
-plist = "=1.10.1"
-minisign = "=0.7.3"
-tempfile = "=3.27.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+semver = "1.0.28"
+minisign-verify = "0.2.5"
+base64 = "0.23.1"
+ureq = "3.4.2"
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+tar = { version = "0.4.46", default-features = false }
+plist = "1.10.1"
+minisign = "0.7.3"
+tempfile = "3.27.0"
