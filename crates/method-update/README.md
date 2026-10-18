@@ -235,10 +235,12 @@ check completes, What's New is shown, or the person flips the switch.
 Keep the page, the Help menu items, the commands (`update_status`, `update_restart`,
 `whats_new`) and the `update-status` event. Underneath:
 
-- `Machine`, `Phase`, `Said`, `Start`, `Status`, `UpdateSettings`, `whats_new_due`,
-  `allowed_hosts`, `unavailable_reason`, `FIRST_CHECK` and `CHECK_EVERY` come from
-  `method_update::policy` and `AppConfig`. `updates.json` keeps its shape
-  (`automatic`, `seen`), so existing settings carry over.
+- `Machine`, `Phase`, `Said`, `Start`, `Status`, `whats_new_due`, `FIRST_CHECK` and
+  `CHECK_EVERY` come from `method_update::policy` under the same names. The app's
+  `UpdateSettings` becomes `policy::Settings`; `allowed_hosts` and `unavailable_reason`
+  become `AppConfig::allowed_hosts` and `AppConfig::unavailable_reason`; `allowed`
+  becomes `transport::host_allowed`. `updates.json` keeps its shape (`automatic`,
+  `seen`), so existing settings carry over.
 - The endpoint and public key move from `plugins.updater` in `tauri.conf.json` into
   `AppConfig` (baked constants), and `tauri-plugin-updater` is removed.
 - `check_now` becomes `Updater::check_now` on a blocking thread; the redirect policy is
