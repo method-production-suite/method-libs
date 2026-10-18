@@ -303,6 +303,27 @@ pub struct Swept {
 /// another copy of the app, so it is left alone (a swap takes seconds).
 const LEFTOVER_AGE: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// How the sweep dates a leftover: the moment it became one.
+pub type Stamp = fn(&std::fs::Metadata) -> std::time::SystemTime;
+
+/// When a folder was last changed, the sweep's [`Stamp`]. On unix that is
+/// its ctime: a swap makes its backup by RENAMING the running bundle, which
+/// keeps the bundle's mtime (often days old) but sets the ctime to now, so
+/// mtime would make a backup seconds old look stale. Elsewhere, its mtime.
+pub fn changed_at(meta: &std::fs::Metadata) -> std::time::SystemTime {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let secs = u64::try_from(meta.ctime()).unwrap_or(0);
+        let nanos = u32::try_from(meta.ctime_nsec()).unwrap_or(0);
+        std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.modified().unwrap_or(std::time::UNIX_EPOCH)
+    }
+}
+
 /// The leftovers of an interrupted swap beside `dir/name`
 /// (`.<name>.old-<pid>` and `.<name>.update-<pid>`, from any process but
 /// `own_pid`; for the app's current and legacy names, those of both). A
@@ -311,13 +332,27 @@ const LEFTOVER_AGE: std::time::Duration = std::time::Duration::from_secs(600);
 /// bundle is moved back under the name it had. Once a bundle is there,
 /// leftovers older than ten minutes are removed, except `running`: the
 /// bundle this process runs from is never deleted, however old. With no
-/// bundle and no usable backup nothing is touched.
+/// bundle and no usable backup nothing is touched. A leftover's age is
+/// counted from [`changed_at`].
 pub fn sweep_beside(
     dir: &Path,
     name: &str,
     bundle_names: &BundleNames,
     own_pid: u32,
     running: Option<&Path>,
+) -> Swept {
+    sweep_beside_stamped(dir, name, bundle_names, own_pid, running, changed_at)
+}
+
+/// [`sweep_beside`], dating leftovers with `stamp` instead of
+/// [`changed_at`]: for tests, which can set an mtime but never a ctime.
+pub fn sweep_beside_stamped(
+    dir: &Path,
+    name: &str,
+    bundle_names: &BundleNames,
+    own_pid: u32,
+    running: Option<&Path>,
+    stamp: Stamp,
 ) -> Swept {
     let mut swept = Swept::default();
     let names = bundle_names.standing_for(name);
@@ -331,14 +366,8 @@ pub fn sweep_beside(
             let (n, tag, pid) = parse_sibling(file.to_str()?)?;
             // A real folder only: never follow a link out of the folder.
             let meta = std::fs::symlink_metadata(e.path()).ok()?;
-            (names.contains(&n) && pid != own_pid && meta.is_dir()).then(|| {
-                (
-                    e.path(),
-                    n.to_string(),
-                    tag == "old",
-                    meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-                )
-            })
+            (names.contains(&n) && pid != own_pid && meta.is_dir())
+                .then(|| (e.path(), n.to_string(), tag == "old", stamp(&meta)))
         })
         .collect();
     // Newest first.
@@ -361,11 +390,11 @@ pub fn sweep_beside(
         }
     }
     let now = std::time::SystemTime::now();
-    for (path, _, _, modified) in leftovers {
+    for (path, _, _, made) in leftovers {
         if running.is_some_and(|r| same_place(r, &path)) {
             continue;
         }
-        let age = now.duration_since(modified).unwrap_or_default();
+        let age = now.duration_since(made).unwrap_or_default();
         if age >= LEFTOVER_AGE && std::fs::remove_dir_all(&path).is_ok() {
             swept.removed.push(path);
         }
@@ -394,6 +423,11 @@ fn same_place(a: &Path, b: &Path) -> bool {
 /// is left alone, however old, and a later start removes it. Outside a
 /// bundle (a development build, Windows, Linux) nothing is done.
 pub fn sweep_at_startup(exe: &Path, names: &BundleNames) -> Swept {
+    sweep_at_startup_stamped(exe, names, changed_at)
+}
+
+/// [`sweep_at_startup`], dating leftovers with `stamp`: for tests.
+pub fn sweep_at_startup_stamped(exe: &Path, names: &BundleNames, stamp: Stamp) -> Swept {
     let bundle = (|| {
         let macos = exe.parent()?;
         let contents = macos.parent()?;
@@ -413,7 +447,7 @@ pub fn sweep_at_startup(exe: &Path, names: &BundleNames) -> Swept {
         None if file.ends_with(".app") => file,
         None => return Swept::default(),
     };
-    sweep_beside(dir, name, names, std::process::id(), Some(bundle))
+    sweep_beside_stamped(dir, name, names, std::process::id(), Some(bundle), stamp)
 }
 
 fn permission(e: &std::io::Error) -> bool {

@@ -3,11 +3,15 @@
 //! the next start puts it back. A swap that finished but could not delete
 //! its backup leaves a stale one; the next start removes it, unless it is
 //! the bundle this process runs from.
+//!
+//! A leftover's age counts from its ctime, which a test can't set, so most
+//! tests date leftovers by the mtime they set instead (`by_mtime`); the
+//! last test runs the real clock.
 
 mod common;
 
 use common::{make_bundle, names};
-use method_update::install::{Swept, sweep_at_startup, sweep_beside};
+use method_update::install::{Swept, sweep_at_startup_stamped, sweep_beside, sweep_beside_stamped};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -32,8 +36,18 @@ fn age(path: &Path, by: Duration) {
     f.set_modified(SystemTime::now() - by).unwrap();
 }
 
+/// A leftover dated by the mtime a test gave it.
+fn by_mtime(meta: &std::fs::Metadata) -> SystemTime {
+    meta.modified().unwrap()
+}
+
+/// The startup sweep, dating leftovers by mtime.
+fn sweep_at_startup(exe: &Path, names: &method_update::BundleNames) -> Swept {
+    sweep_at_startup_stamped(exe, names, by_mtime)
+}
+
 fn sweep(dir: &Path, name: &str) -> Swept {
-    sweep_beside(dir, name, &names(), ME, None)
+    sweep_beside_stamped(dir, name, &names(), ME, None, by_mtime)
 }
 
 fn version_of(bundle: &Path) -> String {
@@ -368,13 +382,42 @@ fn a_bundle_with_no_legacy_name_sweeps_only_its_own_leftovers() {
     let legacy = apps.path().join(".Old Example.app.old-5");
     std::fs::create_dir_all(&legacy).unwrap();
     age(&legacy, Duration::from_secs(3600));
-    let swept = sweep_beside(
+    let swept = sweep_beside_stamped(
         apps.path(),
         "Method Example.app",
         &method_update::BundleNames::new("Method Example.app"),
         ME,
         None,
+        by_mtime,
     );
     assert_eq!(swept, Swept::default());
     assert!(legacy.exists());
+}
+
+// ---- the age of a leftover is when it was last changed, not modified ----
+
+#[cfg(unix)]
+#[test]
+fn a_backup_renamed_just_now_is_fresh_however_old_its_mtime() {
+    // A swap renames the running bundle to its backup. A rename keeps the
+    // folder's mtime (often days old) but sets its ctime to now; the sweep
+    // must read the backup as minutes old, or another copy starting now
+    // would delete a swap in progress.
+    let apps = tempfile::tempdir().unwrap();
+    make_bundle(
+        &apps.path().join("Method Example.app"),
+        "method-example",
+        "1.3.1",
+    );
+    let made = apps.path().join("made");
+    make_bundle(&made, "method-example", "1.3.0");
+    age(&made, Duration::from_secs(30 * 24 * 3600));
+    let backup = apps.path().join(".Method Example.app.old-123");
+    std::fs::rename(&made, &backup).unwrap();
+    let mtime = std::fs::metadata(&backup).unwrap().modified().unwrap();
+    assert!(SystemTime::now().duration_since(mtime).unwrap() > Duration::from_secs(3600));
+
+    let swept = sweep_beside(apps.path(), "Method Example.app", &names(), ME, None);
+    assert_eq!(swept, Swept::default());
+    assert!(backup.exists(), "renamed seconds ago: kept");
 }
