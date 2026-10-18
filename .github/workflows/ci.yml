@@ -80,6 +80,10 @@ jobs:
         id: crates
         run: |
           if compgen -G "crates/*/Cargo.toml" > /dev/null; then echo "any=true" >> "$GITHUB_OUTPUT"; else echo "any=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Temporary advisory ignores not expired
+        # deny.toml's `# ignore-expires:` date; fails once it has passed while
+        # the ignores it covers are still listed.
+        run: python3 scripts/check-ignore-expiry.py
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         if: steps.crates.outputs.any == 'true'
         with:
