@@ -352,6 +352,9 @@ pub struct Updater {
     /// False while the settings file is one this build couldn't read: then
     /// nothing is written over it except the person's own choice.
     may_write: Mutex<bool>,
+    /// Whether settings were read from the file (false: first run, no
+    /// file, or one this build couldn't read).
+    stored: bool,
     machine: Mutex<Machine>,
     pending: Mutex<Option<(Update, Vec<u8>)>>,
     schedule: Mutex<Schedule>,
@@ -362,7 +365,10 @@ impl Updater {
     /// The updater for `app`, running version `current`, launched at
     /// `launched`, keeping its settings in `settings_file` (`None`: kept in
     /// memory only). Reads the settings, and decides once whether What's New
-    /// is due. A build that cannot update itself
+    /// is due. Writes nothing: the settings are saved when a check
+    /// completes, What's New is shown, or the person flips the switch, so an
+    /// app can first supply its own starting value
+    /// ([`Self::with_initial_automatic`]). A build that cannot update itself
     /// ([`AppConfig::unavailable_reason`], or a version that is not semver)
     /// never checks: no timer, no network.
     pub fn new(
@@ -373,13 +379,11 @@ impl Updater {
     ) -> Self {
         let read = settings_file.as_deref().map(Settings::read);
         let may_write = !matches!(read, Some(Err(_)));
+        let stored = matches!(read, Some(Ok(Some(_))));
         let mut settings = read.and_then(|r| r.ok().flatten()).unwrap_or_default();
         let (due, remember) = whats_new_due(settings.seen.as_deref(), current);
         if let Some(v) = remember {
             settings.seen = Some(v);
-            if let (Some(f), true) = (&settings_file, may_write) {
-                let _ = settings.save(f);
-            }
         }
         let version = crate::manifest::parse_version(current).ok();
         let unavailable = app.unavailable_reason().or_else(|| {
@@ -395,11 +399,23 @@ impl Updater {
             settings_file,
             settings: Mutex::new(settings),
             may_write: Mutex::new(may_write),
+            stored,
             machine: Mutex::new(Machine::default()),
             pending: Mutex::new(None),
             schedule: Mutex::new(Schedule::starting(launched)),
             whats_new: Mutex::new(due),
         }
+    }
+
+    /// The automatic-checks switch to start from when nothing is stored
+    /// yet: an app migrating an older choice (a person who said no to a
+    /// previous version's prompt keeps checks off) supplies it here. A value
+    /// already in the settings file wins. Saved with the rest, later.
+    pub fn with_initial_automatic(self, on: bool) -> Self {
+        if !self.stored {
+            lock(&self.settings).automatic = on;
+        }
+        self
     }
 
     /// The same, on another schedule (tests, a rehearsal).
@@ -484,6 +500,18 @@ impl Updater {
     /// [`Self::check_now`] with the network supplied: `check` asks for a
     /// newer release, `download` fetches and verifies it.
     pub fn check_with(
+        &self,
+        manual: bool,
+        check: impl FnOnce() -> Result<Option<Update>, String>,
+        download: impl FnOnce(&Update) -> Result<Vec<u8>, String>,
+    ) -> Option<Said> {
+        let said = self.run_check(manual, check, download);
+        // A check has completed (or was refused): keep the settings now.
+        self.persist(&lock(&self.settings));
+        said
+    }
+
+    fn run_check(
         &self,
         manual: bool,
         check: impl FnOnce() -> Result<Option<Update>, String>,
@@ -740,6 +768,30 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_written_until_a_check_completes_and_the_app_s_value_comes_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("updates.json");
+        // First run: the app knows the person said no in its previous
+        // version, and says so before anything is written.
+        let u = Updater::new(app(&key()), "1.0.0", Some(file.clone()), Instant::now())
+            .with_initial_automatic(false);
+        assert!(!file.exists(), "nothing written on construction");
+        assert!(!u.automatic());
+        u.check_with(true, || Ok(None), |_| unreachable!());
+        assert_eq!(
+            Settings::read(&file).unwrap(),
+            Some(Settings {
+                automatic: false,
+                seen: Some("1.0.0".into())
+            })
+        );
+        // Once a value is stored, the app's initial value no longer applies.
+        let again = Updater::new(app(&key()), "1.0.0", Some(file.clone()), Instant::now())
+            .with_initial_automatic(true);
+        assert!(!again.automatic());
+    }
+
+    #[test]
     fn the_updater_keeps_the_switch_and_what_s_new() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("sub/updates.json");
@@ -749,8 +801,8 @@ mod tests {
         assert!(u.unavailable().is_none(), "{:?}", u.unavailable());
         assert!(u.automatic());
         assert!(!u.take_whats_new(), "a first run is not an update");
-        assert_eq!(Settings::load(&file).seen.as_deref(), Some("1.0.0"));
         u.set_automatic(false).unwrap();
+        assert_eq!(Settings::load(&file).seen.as_deref(), Some("1.0.0"));
         assert!(!u.due(t0 + FIRST_CHECK), "off: never due");
 
         let u = Updater::new(app(&k), "1.1.0", Some(file.clone()), t0);

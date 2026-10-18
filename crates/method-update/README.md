@@ -215,8 +215,9 @@ Gone: `install_appimage`, `nsis_update_args`, `updater_os`, `updater_arch` and e
 New for Reader: the host rule (every request and redirect is checked), the startup sweep
 never deletes the bundle it runs from, and the `policy` module, which replaces Reader's
 opt-in prompt with the suite's automatic checks. A person who said no to the old prompt
-keeps checks off: on the first run with `method-update`, write
-`Settings { automatic: false, .. }` to the settings file for them.
+keeps checks off: build the `Updater` with `.with_initial_automatic(false)` for them.
+It applies only while nothing is stored yet, and the `Updater` writes nothing until a
+check completes, What's New is shown, or the person flips the switch.
 
 ### Method Budget and Method Schedule (from `tauri-plugin-updater`)
 
