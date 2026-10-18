@@ -7,7 +7,12 @@
 //!
 //! Nothing here knows which app it serves. Each app builds one
 //! [`AppConfig`] (its name, bundle name, user agent, endpoint, key and the
-//! sentences it shows) and hands it to the functions below.
+//! sentences it shows) and hands it to the functions below. The
+//! [`policy`] module adds the suite's update behaviour on top: a first
+//! check 2 minutes after launch, then one every 6 hours, a switch for
+//! automatic checks that is on by default, the settings file that keeps it,
+//! and the state machine a window draws. It is driven by the app's own
+//! timer or thread, so any UI framework can use it.
 //!
 //! Updates are for Apple silicon Macs only (SUITE-STANDARDS.md, section 1):
 //! the manifest key is `darwin-aarch64`. The crate still builds and tests
@@ -27,13 +32,17 @@ pub mod flow;
 pub mod gate;
 pub mod install;
 pub mod manifest;
+pub mod policy;
 pub mod restart;
 pub mod target;
 pub mod transport;
 pub mod verify;
 
+mod fsutil;
+
 pub use config::{AppConfig, Baked, BundleNames, GITHUB_DOWNLOAD_HOSTS, Messages};
 pub use install::{InstallError, Installed, Swept};
 pub use manifest::{Platform, Release};
+pub use policy::{Phase, Said, Settings, Status, Updater};
 pub use target::{Installer, TargetSet};
 pub use transport::{Config, Update, UpdateError, check, download};
