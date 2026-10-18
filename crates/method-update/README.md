@@ -29,9 +29,13 @@ suite's update behaviour built in.
   minutes, but never the bundle the app is running from.
 - **Policy** (`method_update::policy`): first check 2 minutes after launch, then every 6
   hours; a "Check for Updates Automatically" switch, on by default, kept in a small JSON
-  file the app names (written atomically); the state machine a window draws (idle,
-  checking, downloading, ready, installing, failed). An automatic check that fails says
-  nothing; a check the person asked for always answers.
+  file the app names (written atomically, and never over a file it couldn't read); the
+  state machine a window draws (idle, checking, downloading, ready, installing, failed,
+  read-only). An automatic check that fails says nothing; a check the person asked for
+  always answers. Before each check a cheap probe beside the bundle makes sure an update
+  could be installed there: an app running from a read-only place (translocated, or
+  opened from its disk image) is told "Move it to the Applications folder" and downloads
+  nothing.
 
 No UI framework, no async runtime, no threads of its own: the app's timer or thread
 drives it. The updater never reads or checks the bundle identifier.
@@ -99,12 +103,17 @@ use std::sync::Arc;
 use std::time::Instant;
 use method_update::{Updater, policy::TICK};
 
-let updater = Arc::new(Updater::new(
+let mut updater = Updater::new(
     update_config(),
     env!("CARGO_PKG_VERSION"),
     Some(data_dir.join("updates.json")),
     Instant::now(),
-));
+);
+// Probe the install location before each check (read-only: say so, fetch nothing).
+if let Some(bundle) = std::env::current_exe().ok().as_deref().and_then(method_update::install::bundle_of_exe) {
+    updater = updater.with_bundle(bundle);
+}
+let updater = Arc::new(updater);
 
 // The app's own timer: a thread that looks now and then.
 let u = updater.clone();
@@ -151,7 +160,9 @@ progress to finish, "Restart now") can use `method_update::flow` with
 
 The window keeps its own menu items, commands and events; only the work underneath moves
 here. `Status` serializes to the same shape the page already reads (`phase`, `version`,
-`manual`, `said`, `automatic`, plus `available` and `message`).
+`manual`, `said`, `automatic`, plus `available` and `message`). Two values are new: the
+phase `failed` (a check the person asked for, with its `message`) and the phase and
+`said` value `read-only` (with the "Move it to the Applications folder" `message`).
 
 ```rust
 app.manage(Arc::new(Updater::new(

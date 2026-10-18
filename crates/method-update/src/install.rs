@@ -450,6 +450,52 @@ pub fn sweep_at_startup_stamped(exe: &Path, names: &BundleNames, stamp: Stamp) -
     sweep_beside_stamped(dir, name, names, std::process::id(), Some(bundle), stamp)
 }
 
+/// Whether an update could be put where the bundle is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Writability {
+    /// This account can write beside the bundle.
+    Writable,
+    /// Only an administrator can ([`admin_swap`] will ask).
+    NeedsAdmin,
+    /// Nobody can: the bundle is on a read-only volume. A Mac runs an app
+    /// it moved aside for safety (App Translocation) or one opened straight
+    /// from its disk image that way. The person has to move the app to
+    /// Applications first.
+    ReadOnly,
+}
+
+/// What a failure to write beside the bundle means.
+pub fn classify(e: &std::io::Error) -> Writability {
+    // EROFS is 30 on macOS and Linux.
+    if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem
+        || (cfg!(unix) && e.raw_os_error() == Some(30))
+    {
+        Writability::ReadOnly
+    } else if permission(e) {
+        Writability::NeedsAdmin
+    } else {
+        // Anything else is left for the install itself to report.
+        Writability::Writable
+    }
+}
+
+/// A cheap probe before anything is downloaded: make and remove a hidden
+/// folder beside `bundle`, where the swap's staging folder would go.
+pub fn install_location(bundle: &Path) -> Writability {
+    let probe = sibling(bundle, "probe");
+    match std::fs::create_dir(&probe) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir(&probe);
+            Writability::Writable
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_dir(&probe);
+            Writability::Writable
+        }
+        Err(e) => classify(&e),
+    }
+}
+
 fn permission(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::PermissionDenied
 }
@@ -653,6 +699,44 @@ pub fn admin_swap(bundle: &Path, new: &Path, names: &BundleNames) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_only_volume_is_told_from_a_folder_that_needs_an_administrator() {
+        let erofs = std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem);
+        assert_eq!(classify(&erofs), Writability::ReadOnly);
+        #[cfg(unix)]
+        assert_eq!(
+            classify(&std::io::Error::from_raw_os_error(30)),
+            Writability::ReadOnly,
+            "EROFS, as a translocated app or a mounted disk image answers"
+        );
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(classify(&denied), Writability::NeedsAdmin);
+        let other = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            classify(&other),
+            Writability::Writable,
+            "the install says why"
+        );
+    }
+
+    #[test]
+    fn the_probe_writes_beside_the_bundle_and_leaves_nothing() {
+        let apps = tempfile::tempdir().unwrap();
+        let bundle = apps.path().join("Method Example.app");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        assert_eq!(install_location(&bundle), Writability::Writable);
+        let left: Vec<_> = std::fs::read_dir(apps.path()).unwrap().collect();
+        assert_eq!(left.len(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(apps.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+            let found = install_location(&bundle);
+            std::fs::set_permissions(apps.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(found, Writability::NeedsAdmin);
+        }
+    }
 
     #[test]
     fn the_bundle_is_found_from_its_executable() {

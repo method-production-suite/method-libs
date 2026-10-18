@@ -157,6 +157,9 @@ pub struct Messages {
     /// What every engine call is told once the bundle has been swapped
     /// ([`crate::gate::EngineGate`]).
     pub updated: String,
+    /// The app runs from a read-only place (translocated, or opened from
+    /// its disk image), so it can't be updated where it is.
+    pub read_only: String,
 }
 
 impl Messages {
@@ -165,6 +168,7 @@ impl Messages {
         Self {
             too_large: format!("The update is larger than any {display_name} could be."),
             updated: format!("{display_name} has been updated. Restart it to keep going."),
+            read_only: format!("Move {display_name} to the Applications folder to get updates."),
         }
     }
 }

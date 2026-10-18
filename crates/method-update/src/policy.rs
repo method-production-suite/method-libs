@@ -24,7 +24,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
-use crate::install::{Admin, InstallError, Installed, install_app};
+use crate::install::{Admin, InstallError, Installed, Writability, install_app};
 use crate::target::Installer;
 use crate::transport::{Update, check, download};
 
@@ -158,6 +158,10 @@ pub enum Phase {
     Installing {
         version: String,
     },
+    /// The app runs from a read-only place (translocated, or opened from
+    /// its disk image): nothing is fetched until it is moved. The window
+    /// can say [`crate::Messages::read_only`].
+    ReadOnly,
     /// A check (or its download) the person asked for didn't work. An
     /// automatic one never comes here: it goes back to idle, silently.
     Failed {
@@ -175,6 +179,8 @@ pub enum Said {
     Failed,
     /// Restart to update couldn't install; the update is still ready.
     InstallFailed,
+    /// A check the person asked for found the app in a read-only place.
+    ReadOnly,
 }
 
 /// What a check asks for next.
@@ -204,7 +210,7 @@ impl Default for Machine {
 impl Machine {
     pub fn start_check(&mut self, manual: bool) -> Start {
         match &mut self.phase {
-            Phase::Idle | Phase::Failed { .. } => {
+            Phase::Idle | Phase::Failed { .. } | Phase::ReadOnly => {
                 self.phase = Phase::Checking { manual };
                 Start::Check
             }
@@ -264,6 +270,16 @@ impl Machine {
         }
     }
 
+    /// The probe before the check found a read-only place: nothing is
+    /// fetched. Said to a person who asked; shown as a phase either way.
+    pub fn read_only(&mut self) -> Option<Said> {
+        let Phase::Checking { manual } = self.phase else {
+            return None;
+        };
+        self.phase = Phase::ReadOnly;
+        manual.then_some(Said::ReadOnly)
+    }
+
     /// The person has seen a failure: back to idle.
     pub fn dismiss(&mut self) {
         if matches!(self.phase, Phase::Failed { .. }) {
@@ -307,6 +323,7 @@ impl Machine {
             Phase::Ready { version } => ("ready", Some(version.clone()), false, None),
             Phase::Installing { version } => ("installing", Some(version.clone()), false, None),
             Phase::Failed { message } => ("failed", None, true, Some(message.clone())),
+            Phase::ReadOnly => ("read-only", None, false, None),
         };
         Status {
             phase,
@@ -323,13 +340,15 @@ impl Machine {
 /// What the window is told; serializable, so a Tauri app can emit it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Status {
-    /// "idle", "checking", "downloading", "ready", "installing" or "failed".
+    /// "idle", "checking", "downloading", "ready", "installing", "failed"
+    /// or "read-only".
     pub phase: &'static str,
     /// The update's version, once one was found.
     pub version: Option<String>,
     /// The person asked for this check: show its progress.
     pub manual: bool,
-    /// Why a check the person asked for failed.
+    /// Why a check the person asked for failed, or, when read-only, what to
+    /// do about it.
     pub message: Option<String>,
     /// A one-time answer to show (then let go).
     pub said: Option<Said>,
@@ -359,7 +378,11 @@ pub struct Updater {
     pending: Mutex<Option<(Update, Vec<u8>)>>,
     schedule: Mutex<Schedule>,
     whats_new: Mutex<bool>,
+    /// Asked before every check: can an update go where the app is?
+    location: Option<LocationProbe>,
 }
+
+type LocationProbe = Box<dyn Fn() -> Writability + Send + Sync>;
 
 impl Updater {
     /// The updater for `app`, running version `current`, launched at
@@ -404,6 +427,7 @@ impl Updater {
             pending: Mutex::new(None),
             schedule: Mutex::new(Schedule::starting(launched)),
             whats_new: Mutex::new(due),
+            location: None,
         }
     }
 
@@ -415,6 +439,24 @@ impl Updater {
         if !self.stored {
             lock(&self.settings).automatic = on;
         }
+        self
+    }
+
+    /// The bundle the app runs from: before every check, a cheap probe
+    /// ([`crate::install::install_location`]) makes sure an update could go
+    /// there, and a read-only place (a translocated app, or one run from its
+    /// disk image) is said instead of downloading an update that can't be
+    /// installed.
+    pub fn with_bundle(self, bundle: PathBuf) -> Self {
+        self.with_location_probe(move || crate::install::install_location(&bundle))
+    }
+
+    /// The same with any probe (tests).
+    pub fn with_location_probe(
+        mut self,
+        probe: impl Fn() -> Writability + Send + Sync + 'static,
+    ) -> Self {
+        self.location = Some(Box::new(probe));
         self
     }
 
@@ -471,7 +513,12 @@ impl Updater {
 
     /// What the window is told, with a one-time answer if there is one.
     pub fn status(&self, said: Option<Said>) -> Status {
-        lock(&self.machine).status(self.automatic(), self.unavailable.is_none(), said)
+        let mut status =
+            lock(&self.machine).status(self.automatic(), self.unavailable.is_none(), said);
+        if status.phase == "read-only" {
+            status.message = Some(self.app.messages.read_only.clone());
+        }
+        status
     }
 
     /// The app's timer asks this now and then: true when an automatic check
@@ -529,6 +576,13 @@ impl Updater {
         }
         if lock(&self.machine).start_check(manual) != Start::Check {
             return None;
+        }
+        if self
+            .location
+            .as_ref()
+            .is_some_and(|probe| probe() == Writability::ReadOnly)
+        {
+            return lock(&self.machine).read_only();
         }
         let found = check();
         let version = match &found {
@@ -879,6 +933,36 @@ mod tests {
         assert_eq!(u.status(None).phase, "ready");
         assert!(u.ready().is_some(), "still there for another try");
         assert!(bundle.join("Contents").is_dir(), "the old bundle untouched");
+    }
+
+    #[test]
+    fn a_read_only_location_is_said_before_anything_is_fetched() {
+        use crate::install::Writability;
+        let u = Updater::new(app(&key()), "1.0.0", None, Instant::now())
+            .with_location_probe(|| Writability::ReadOnly);
+        // Neither the check nor the download runs.
+        assert_eq!(
+            u.check_with(false, || unreachable!(), |_| unreachable!()),
+            None
+        );
+        assert_eq!(u.phase(), Phase::ReadOnly);
+        let st = u.status(None);
+        assert_eq!(st.phase, "read-only");
+        assert_eq!(
+            st.message.as_deref(),
+            Some("Move Method Example to the Applications folder to get updates.")
+        );
+        assert_eq!(
+            u.check_with(true, || unreachable!(), |_| unreachable!()),
+            Some(Said::ReadOnly)
+        );
+        // Moved somewhere writable: checks run again.
+        let u = Updater::new(app(&key()), "1.0.0", None, Instant::now())
+            .with_location_probe(|| Writability::NeedsAdmin);
+        assert_eq!(
+            u.check_with(true, || Ok(None), |_| unreachable!()),
+            Some(Said::Current)
+        );
     }
 
     #[test]
