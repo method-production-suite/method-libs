@@ -1,0 +1,9 @@
+# Keep text files LF on every platform, so Windows checkouts compare byte for byte the
+# way macOS and Linux do (SUITE-STANDARDS §6).
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.icns binary
+*.pdf binary
+*.zip binary
+*.gz binary
