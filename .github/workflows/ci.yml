@@ -5,20 +5,29 @@ on:
   push:
     branches: [main]
   pull_request:
+    # Drafts build nothing; marking a PR ready starts CI (SUITE-STANDARDS §6).
+    types: [opened, synchronize, reopened, ready_for_review]
+  # nightly.yml calls this with full: true for macOS and Windows (Lean CI, §6).
+  workflow_call:
+    inputs:
+      full:
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   rust:
-    # fmt, clippy and tests on every desktop OS the apps ship on. The Rust steps
-    # run whenever crates/*/Cargo.toml exists (crates/method-update does); with no
-    # crates Cargo would have nothing to build, so they are skipped.
+    # fmt, clippy and tests. Pull requests and pushes to main run Linux only; the
+    # nightly (full: true) adds macOS and Windows (Lean CI, SUITE-STANDARDS §6). The
+    # Rust steps run whenever crates/*/Cargo.toml exists (crates/method-update does).
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15, windows-latest]
+        os: ${{ fromJSON(inputs.full && '["ubuntu-latest","macos-15","windows-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -40,6 +49,7 @@ jobs:
         if: steps.crates.outputs.any == 'true'
         run: cargo test --workspace --locked
   cooldown:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     # Fails a change that adds crates published less than 14 days ago (Method Budget's
     # check, scripts/check-crate-ages.py).
     runs-on: ubuntu-latest
@@ -68,6 +78,7 @@ jobs:
             python3 scripts/check-crate-ages.py --lock Cargo.lock
           fi
   deny:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     # deny.toml: known advisories, licenses compatible with MIT OR Apache-2.0,
     # crates.io as the only source. Skipped only when there are no crates.
     runs-on: ubuntu-latest
