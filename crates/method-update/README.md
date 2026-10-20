@@ -1,13 +1,13 @@
 # method-update
 
 The Method Production Suite's updater: one crate every suite app can use to check for,
-download, verify and install a new version of itself on an Apple silicon Mac, with the
+download, verify and install a new version of itself on a Mac (Apple silicon or Intel), with the
 suite's update behaviour built in.
 
 - **Manifest**: `latest.json` in Tauri's static format, the file every suite release
-  pipeline already publishes. The key it reads is `darwin-aarch64` (after
-  `darwin-aarch64-app`). Any other machine is told updates are for Apple silicon Macs
-  only.
+  pipeline already publishes. The key it reads is `darwin-aarch64` on Apple
+  silicon and `darwin-x86_64` on Intel (each after its `-app` key); a universal release
+  lists the same file under both. Any other machine is told updates are for Macs only.
 - **Signature**: minisign, against the one public key the app was built with. The
   signature's trusted comment must name the version the manifest announces.
 - **Network**: https only, and only to the endpoint's host, GitHub's two download hosts
@@ -221,7 +221,7 @@ import of the old window's storage), and the tests `tauri_conf.rs` and `webkit.r
 Reader's `build.rs` guard stays with Reader too, as in the snippet above.
 
 Gone: `install_appimage`, `nsis_update_args`, `updater_os`, `updater_arch` and every
-`Installer` but `App`: the suite updates Apple silicon Macs only.
+`Installer` but `App`: the suite updates Macs only.
 
 New for Reader: the host rule (every request and redirect is checked), the startup sweep
 never deletes the bundle it runs from, and the `policy` module, which replaces Reader's

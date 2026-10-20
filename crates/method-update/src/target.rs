@@ -3,10 +3,13 @@
 //! `<os>-<arch>-<installer>` first and then `<os>-<arch>`; this crate does
 //! the same, so the keys the release pipelines write keep working.
 //!
-//! The suite updates Apple silicon Macs only (SUITE-STANDARDS.md, section
-//! 1), so the only key a real build asks for is `darwin-aarch64` (after
-//! `darwin-aarch64-app`). Any other build has no key: a check says so, in
-//! the format's own words, rather than offering it a file it cannot run.
+//! The suite updates Macs, Apple silicon and Intel (SUITE-STANDARDS.md,
+//! section 3: universal builds since 2026-10-19), so a real build asks for
+//! `darwin-aarch64` or `darwin-x86_64` (after the `-app` key). A universal
+//! .app runs its own slice, so it asks for the key of the chip it runs on;
+//! the release lists the same universal file under both. Any other build
+//! has no key: a check says so, in the format's own words, rather than
+//! offering it a file it cannot run.
 //! Tests name other keys through [`TargetSet::new`].
 
 use crate::manifest::{Platform, Release};
@@ -48,13 +51,15 @@ impl TargetSet {
         }
     }
 
-    /// This build, installed as `installer`: an Apple silicon Mac, or an
-    /// error saying updates are for those only.
+    /// This build, installed as `installer`: a Mac (Apple silicon or Intel),
+    /// or an error saying updates are for Macs only.
     pub fn current(installer: Option<Installer>) -> Result<Self, String> {
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             Ok(Self::new("darwin", "aarch64", installer))
+        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            Ok(Self::new("darwin", "x86_64", installer))
         } else {
-            Err("Updates are for Apple silicon Macs only (`darwin-aarch64`).".into())
+            Err("Updates are for Macs only (`darwin-aarch64`, `darwin-x86_64`).".into())
         }
     }
 
@@ -113,12 +118,22 @@ mod tests {
     }
 
     #[test]
-    fn only_an_apple_silicon_mac_has_a_key() {
+    fn only_a_mac_has_a_key() {
         let t = TargetSet::current(None);
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             assert_eq!(t.unwrap().keys, ["darwin-aarch64"]);
+        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            assert_eq!(t.unwrap().keys, ["darwin-x86_64"]);
         } else {
-            assert!(t.unwrap_err().contains("Apple silicon"));
+            assert!(t.unwrap_err().contains("Macs only"));
         }
+    }
+
+    #[test]
+    fn an_intel_mac_picks_its_own_key_from_a_universal_release() {
+        let t = TargetSet::new("darwin", "x86_64", Some(Installer::App));
+        assert_eq!(t.keys, ["darwin-x86_64-app", "darwin-x86_64"]);
+        let universal = release(&["darwin-aarch64", "darwin-x86_64"]);
+        assert_eq!(t.pick(&universal).unwrap().url, "https://x/darwin-x86_64");
     }
 }
