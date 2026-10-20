@@ -14,9 +14,9 @@
 //! and the state machine a window draws. It is driven by the app's own
 //! timer or thread, so any UI framework can use it.
 //!
-//! Updates are for Apple silicon Macs only (SUITE-STANDARDS.md, section 1):
-//! the manifest key is `darwin-aarch64`. The crate still builds and tests
-//! on every desktop OS, because the apps do.
+//! Updates are for Macs, Apple silicon and Intel (SUITE-STANDARDS.md,
+//! section 3): the manifest keys are `darwin-aarch64` and `darwin-x86_64`.
+//! The crate still builds and tests on every desktop OS, because the apps do.
 //!
 //! No UI framework, no async runtime. HTTPS through ureq and rustls, and
 //! only to the endpoint's host and GitHub's two download hosts, redirects
