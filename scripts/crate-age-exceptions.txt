@@ -1,0 +1,4 @@
+# Exact versions allowed under the 14-day cooldown: "NAME VERSION  # reason".
+# A reason naming a RUSTSEC id is a security fix and is honoured at release too.
+rustls-webpki 0.103.16  # security: RUSTSEC-2026-0382 (distrusted emSign intermediates)
+webpki-roots 1.0.10  # security: RUSTSEC-2026-0381 (emSign ECC Root CA - G3 removed)
