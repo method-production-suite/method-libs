@@ -394,6 +394,8 @@ source = "git+{REPO}?rev={SHA}#{SHA}"
             self.assertEqual(self.main("--release", "--tag", "v1.0.0", exceptions=exc)[0], 1, other)
         exc = "foo 1.2.2   # owner-approved override, the owner, 2026-10-27, release v1.0.0; remove on 2026-11-06\n"
         self.assertEqual(self.main("--release", "--tag", "v1.0.0", exceptions=exc)[0], 0)
+        rc = "foo 1.2.2   # owner-approved override, the owner, 2026-10-27, release v1.0.0-rc1\n"
+        self.assertEqual(self.main("--release", "--tag", "v1.0.0-rc1", exceptions=rc)[0], 0)
 
     def test_security_and_release(self):
         exc = "foo 1.2.2   # RUSTSEC-2026-0001\n"
