@@ -210,7 +210,8 @@ def external_packages(lock_text):
 
 
 OWNER_APPROVED = "owner-approved override"
-RELEASE_TAG = re.compile(r"\brelease (v\d+\.\d+\.\d+)\b")
+# The tag ends there: "release v1.0.0-rc1" or "release v1.0.0.1" is not v1.0.0.
+RELEASE_TAG = re.compile(r"\brelease (v\d+\.\d+\.\d+)(?![\w.+-])")
 
 
 def read_exceptions(path):

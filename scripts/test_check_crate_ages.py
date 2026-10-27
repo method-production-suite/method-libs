@@ -388,6 +388,13 @@ source = "git+{REPO}?rev={SHA}#{SHA}"
         unnamed = "foo 1.2.2   # owner-approved override, the owner, 2026-10-27\n"
         self.assertEqual(self.main("--release", "--tag", "v1.0.0", exceptions=unnamed)[0], 1)
 
+    def test_owner_override_names_the_whole_tag(self):
+        for other in ("v1.0.0-rc1", "v1.0.0.1", "v1.0.0+build", "v1.0.0x"):
+            exc = f"foo 1.2.2   # owner-approved override, the owner, 2026-10-27, release {other}\n"
+            self.assertEqual(self.main("--release", "--tag", "v1.0.0", exceptions=exc)[0], 1, other)
+        exc = "foo 1.2.2   # owner-approved override, the owner, 2026-10-27, release v1.0.0; remove on 2026-11-06\n"
+        self.assertEqual(self.main("--release", "--tag", "v1.0.0", exceptions=exc)[0], 0)
+
     def test_security_and_release(self):
         exc = "foo 1.2.2   # RUSTSEC-2026-0001\n"
         self.assertEqual(self.main("--release", exceptions=exc)[0], 0)
