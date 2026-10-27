@@ -179,6 +179,20 @@ class Cooldown(unittest.TestCase):
                       exceptions=exc, release=True)
         self.assertEqual(bad, [])
 
+    def test_owner_override_holds_for_its_tag_only(self):
+        exc = {("foo", "1.2.2"): ("owner-approved", "v1.0.0")}
+        def index():
+            return {idx_url("foo"): Response(self.INDEX)}
+        bad, *_ = run({crate("foo", "1.2.2")}, index(), exceptions=exc)
+        self.assertEqual(bad, [])
+        bad, *_ = run({crate("foo", "1.2.2")}, index(), exceptions=exc, release=True, tag="v1.0.0")
+        self.assertEqual(bad, [])
+        for tag in ("v1.0.1", "v0.6.0", None):
+            bad, _, _, out, _ = run({crate("foo", "1.2.2")}, index(), exceptions=exc,
+                                    release=True, tag=tag)
+            self.assertEqual(bad, ["foo 1.2.2"], tag)
+            self.assertIn("the owner's override for v1.0.0 only", out[0])
+
     def test_exception_file_kinds(self):
         with tempfile.TemporaryDirectory() as d:
             path = pathlib.Path(d) / "crate-age-exceptions.txt"
@@ -186,11 +200,15 @@ class Cooldown(unittest.TestCase):
                 "# comment line\n"
                 "rustls 0.23.46   # RUSTSEC-2026-0346 (2026-10-14)\n"
                 "parley 0.12.0    # no older compatible release; 2026-10-23\n"
+                "clipboard-win 5.4.3  # owner-approved override, the owner, 2026-10-27, release v1.0.0\n"
+                "muda 0.21.2      # owner-approved override, the owner, 2026-10-19, no release named\n"
                 "malformed\n"
             )
             self.assertEqual(cca.read_exceptions(path), {
                 ("rustls", "0.23.46"): "security",
                 ("parley", "0.12.0"): "age-out",
+                ("clipboard-win", "5.4.3"): ("owner-approved", "v1.0.0"),
+                ("muda", "0.21.2"): "age-out",
             })
         self.assertEqual(cca.read_exceptions(pathlib.Path("/nonexistent/file")), {})
 
@@ -361,6 +379,14 @@ source = "git+{REPO}?rev={SHA}#{SHA}"
         exc = "foo 1.2.2   # waits for a dependency; 2026-10-30\n"
         self.assertEqual(self.main(exceptions=exc)[0], 0)
         self.assertEqual(self.main("--release", exceptions=exc)[0], 1)
+
+    def test_owner_override_and_release(self):
+        exc = "foo 1.2.2   # owner-approved override, the owner, 2026-10-27, release v1.0.0\n"
+        self.assertEqual(self.main("--release", "--tag", "v1.0.0", exceptions=exc)[0], 0)
+        self.assertEqual(self.main("--release", "--tag", "v1.0.1", exceptions=exc)[0], 1)
+        self.assertEqual(self.main("--release", exceptions=exc)[0], 1)
+        unnamed = "foo 1.2.2   # owner-approved override, the owner, 2026-10-27\n"
+        self.assertEqual(self.main("--release", "--tag", "v1.0.0", exceptions=unnamed)[0], 1)
 
     def test_security_and_release(self):
         exc = "foo 1.2.2   # RUSTSEC-2026-0001\n"

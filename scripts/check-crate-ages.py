@@ -7,7 +7,7 @@
 """Supply-chain cooldown check: fail if any crates.io package in Cargo.lock is too new.
 
 Usage: python3 scripts/check-crate-ages.py [--days 14] [--lock Cargo.lock]
-                                          [--only-changed REF] [--release]
+                                          [--only-changed REF] [--release [--tag vX.Y.Z]]
                                           [--exceptions FILE] [--git-allow FILE]
 
 Reads each locked crates.io version's publish time ("pubtime") and yanked flag from
@@ -30,13 +30,17 @@ scripts/crate-age-git-allow.txt, and only when Cargo.toml pins it with rev = the
 cannot change under us and the repository was reviewed when it was added to the list.
 
 scripts/crate-age-exceptions.txt lists exact versions allowed under the cooldown, one
-"NAME VERSION  # reason" per line, of two kinds:
+"NAME VERSION  # reason" per line, of three kinds:
   - security: the reason names a RUSTSEC id; a young version that fixes an advisory.
+  - owner-approved: the reason starts "owner-approved override" and names the one release
+    it is for, "release vX.Y.Z", with the owner's words and the date.
   - age-out: anything else; a version that cannot be pinned back, with the date it turns
     14 days old, so main stays green while it ages.
---release (the release workflow, before any build or signing step) honours only the
-security entries, so no release ships while an age-out entry is still young. Once a
-listed version is old enough, or no longer locked, the check warns so its line is removed.
+--release (the release workflow, before any build or signing step) honours the security
+entries, and an owner-approved entry only when --tag is the release it names; a missing or
+different tag refuses it. So no release ships while an age-out entry is still young, and an
+override never carries over to the next release. Once a listed version is old enough, or no
+longer locked, the check warns so its line is removed.
 
 With --only-changed REF (pull requests), only packages added or bumped since that git
 ref are checked. Standard library only, so it runs anywhere Python 3.11+ does.
@@ -205,9 +209,15 @@ def external_packages(lock_text):
     }
 
 
+OWNER_APPROVED = "owner-approved override"
+RELEASE_TAG = re.compile(r"\brelease (v\d+\.\d+\.\d+)\b")
+
+
 def read_exceptions(path):
-    """{(name, version): "security" or "age-out"}. A line whose reason names a RUSTSEC
-    advisory is a security entry; any other is an age-out entry."""
+    """{(name, version): "security", "age-out" or ("owner-approved", "vX.Y.Z")}. A line
+    whose reason names a RUSTSEC advisory is a security entry; one starting "owner-approved
+    override" is the owner's override for the release it names (one naming no release is
+    an age-out entry, which a release refuses); any other is an age-out entry."""
     path = pathlib.Path(path)
     if not path.exists():
         return {}
@@ -216,7 +226,14 @@ def read_exceptions(path):
         entry, _, reason = line.partition("#")
         words = entry.split()
         if len(words) == 2:
-            out[(words[0], words[1])] = "security" if "RUSTSEC-" in reason else "age-out"
+            reason = reason.strip()
+            tag = RELEASE_TAG.search(reason)
+            if "RUSTSEC-" in reason:
+                out[(words[0], words[1])] = "security"
+            elif reason.startswith(OWNER_APPROVED) and tag:
+                out[(words[0], words[1])] = ("owner-approved", tag.group(1))
+            else:
+                out[(words[0], words[1])] = "age-out"
     return out
 
 
@@ -273,7 +290,7 @@ def pin_to(index, locked, cutoff):
 
 
 def check(pkgs, registry, *, now, days=14, exceptions=None, git_allow=frozenset(),
-          release=False, full=True, out=print):
+          release=False, tag=None, full=True, out=print):
     """Check (name, version, source) packages. Returns (problems, pins, warnings): the
     failures, the `cargo update --precise` commands that fix the young ones, and the
     exception lines to remove. full=False (an --only-changed run) sees only some of the
@@ -296,14 +313,19 @@ def check(pkgs, registry, *, now, days=14, exceptions=None, git_allow=frozenset(
         age = f"{(now - when).days:5} days" if when else "   old enough"
         kind = exceptions.get((name, version))
         flag = ""
+        override = isinstance(kind, tuple)
         if young and kind == "security":
             flag = "  young, a security exception"
+        elif young and override and (not release or (tag is not None and kind[1] == tag)):
+            flag = f"  young, the owner's override for {kind[1]}"
         elif young and kind == "age-out" and not release:
             flag = "  young, an age-out exception (no release until it is old enough)"
         elif young:
             flag = f"  TOO NEW (< {days} days)"
             if kind == "age-out":
                 flag += ", an age-out exception, which a release does not honour"
+            elif override:
+                flag += f", the owner's override for {kind[1]} only, not {tag or 'an untagged run'}"
             target = pin_to(registry.index(name), version, cutoff)
             if target:
                 flag += f", pin to {target}"
@@ -332,7 +354,11 @@ def main(argv=None, registry=None, now=None):
     ap.add_argument("--only-changed", metavar="REF",
                     help="check only packages added or bumped since this git ref")
     ap.add_argument("--release", action="store_true",
-                    help="for a release: honour only security exceptions, not age-out ones")
+                    help="for a release: honour security exceptions and the owner's override "
+                         "for --tag, not age-out ones")
+    ap.add_argument("--tag", metavar="vX.Y.Z",
+                    help="the release being tagged; with --release, an owner-approved "
+                         "override naming it is honoured")
     ap.add_argument("--exceptions", default=str(EXCEPTIONS), metavar="FILE")
     ap.add_argument("--git-allow", default=str(GIT_ALLOW), metavar="FILE")
     args = ap.parse_args(argv)
@@ -356,6 +382,7 @@ def main(argv=None, registry=None, now=None):
         exceptions=exceptions,
         git_allow=read_git_allow(args.git_allow),
         release=args.release,
+        tag=args.tag,
         full=not args.only_changed,
     )
 
