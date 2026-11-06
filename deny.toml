@@ -4,6 +4,8 @@
 [advisories]
 # Every advisory fails, unmaintained and unsound ones included, unless it is
 # listed here with the reason it does not apply.
+# `unsound` says so out loud: by default cargo-deny reports those only for a direct dependency.
+unsound = "all"
 ignore = []
 
 [licenses]
