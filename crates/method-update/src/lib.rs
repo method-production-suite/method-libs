@@ -27,9 +27,11 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+pub mod codesign;
 pub mod config;
 pub mod flow;
 pub mod gate;
+pub mod highwater;
 pub mod install;
 pub mod manifest;
 pub mod policy;

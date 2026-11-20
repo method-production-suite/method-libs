@@ -28,15 +28,22 @@
 //! restart. A failure puts the old bundle back under its old name. Nothing
 //! else ever renames a bundle.
 //!
+//! Before the running bundle moves, the unpacked one must also pass the
+//! platform's code signature check ([`crate::codesign`]): on a Mac, a valid
+//! `codesign --verify --deep --strict` by the running app's own team. A
+//! refusal is [`InstallError::Signature`], and the installed app is left
+//! as it was.
+//!
 //! [`sweep_at_startup`] cleans up after a swap that was interrupted. The
-//! updater never reads or checks the bundle identifier: the signature is
-//! what vouches for an update.
+//! updater never reads or checks the bundle identifier: the signatures are
+//! what vouch for an update.
 
 use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
 
+use crate::codesign::{CodeSignature, SignatureError};
 use crate::config::BundleNames;
 
 #[derive(Debug)]
@@ -49,6 +56,8 @@ pub enum InstallError {
     NeedsAdmin(String),
     /// No downloaded update is waiting to be installed.
     NothingReady,
+    /// The new bundle's code signature was refused ([`crate::codesign`]).
+    Signature(SignatureError),
 }
 
 impl std::fmt::Display for InstallError {
@@ -56,6 +65,7 @@ impl std::fmt::Display for InstallError {
         match self {
             Self::Io(s) | Self::Archive(s) | Self::NeedsAdmin(s) => f.write_str(s),
             Self::NothingReady => f.write_str("No update is ready to install."),
+            Self::Signature(e) => write!(f, "{e}"),
         }
     }
 }
@@ -509,24 +519,41 @@ pub type Admin<'a> = &'a dyn Fn(&Path, &Path) -> Result<(), InstallError>;
 /// folder the person cannot write (an /Applications owned by another
 /// account) needs an administrator: `admin` is asked to run the swap of
 /// `bundle` for the staged copy (on a Mac, [`admin_swap`] through
-/// osascript).
+/// osascript). The unpacked bundle must first pass this platform's code
+/// signature check ([`crate::codesign::platform`]).
 pub fn install_app(
     bytes: &[u8],
     bundle: &Path,
     names: &BundleNames,
     admin: Admin<'_>,
 ) -> Result<Installed, InstallError> {
+    install_app_with(bytes, bundle, names, admin, crate::codesign::platform())
+}
+
+/// [`install_app`] with the code signature tool supplied (tests stand in
+/// for `/usr/bin/codesign` here). `bundle` is the running app's bundle: its
+/// team is the one the new bundle must carry.
+pub fn install_app_with(
+    bytes: &[u8],
+    bundle: &Path,
+    names: &BundleNames,
+    admin: Admin<'_>,
+    signing: &dyn CodeSignature,
+) -> Result<Installed, InstallError> {
     let dest = install_destination(bundle, names);
     let staging = sibling(&dest, "update");
     let _ = std::fs::remove_dir_all(&staging);
     match std::fs::create_dir(&staging) {
         Ok(()) => {}
-        Err(e) if permission(&e) => return install_with_admin(bytes, bundle, names, admin),
+        Err(e) if permission(&e) => {
+            return install_with_admin(bytes, bundle, names, admin, signing);
+        }
         Err(e) => return Err(io("create", &staging, e)),
     }
     let staged = (|| {
         unpack_app_archive(bytes, &staging)?;
-        bundle_executable(&staging)
+        bundle_executable(&staging)?;
+        crate::codesign::check_and_say(bundle, &staging, signing).map_err(InstallError::Signature)
     })();
     if let Err(e) = staged {
         let _ = std::fs::remove_dir_all(&staging);
@@ -539,7 +566,7 @@ pub fn install_app(
     if had_old && let Err(e) = std::fs::rename(bundle, &backup) {
         let _ = std::fs::remove_dir_all(&staging);
         if permission(&e) {
-            return install_with_admin(bytes, bundle, names, admin);
+            return install_with_admin(bytes, bundle, names, admin, signing);
         }
         return Err(io("move aside", bundle, e));
     }
@@ -563,6 +590,7 @@ fn install_with_admin(
     bundle: &Path,
     names: &BundleNames,
     admin: Admin<'_>,
+    signing: &dyn CodeSignature,
 ) -> Result<Installed, InstallError> {
     let dest = install_destination(bundle, names);
     // The copy an administrator's shell moves into place is staged in a
@@ -575,6 +603,7 @@ fn install_with_admin(
     let result = (|| {
         unpack_app_archive(bytes, &temp)?;
         bundle_executable(&temp)?;
+        crate::codesign::check_and_say(bundle, &temp, signing).map_err(InstallError::Signature)?;
         admin(bundle, &temp)
     })();
     let _ = std::fs::remove_dir_all(&private);
