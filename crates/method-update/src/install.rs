@@ -670,22 +670,64 @@ pub fn touch(path: &Path) {
     }
 }
 
-/// The shell command [`admin_swap_script`] hands an administrator: the old
-/// app moved aside, the new one moved in at `dest` (the old app's own path,
-/// or the current name beside it: [`install_destination`]), and the old one
-/// put back if that move fails (removing it first would leave no app at all
-/// when the move failed after it), then the old one removed.
-pub fn admin_swap_shell(bundle: &Path, new: &Path, dest: &Path) -> String {
+/// What the administrator's script exits with when root's own copy of the
+/// new bundle fails the code signature check.
+pub const ADMIN_UNVERIFIED: i32 = 5;
+
+/// The swap itself, as shell: the old app moved aside, `new` moved in at
+/// `dest`, the old one put back if that move fails (removing it first would
+/// leave no app at all when the move failed after it), then the old one
+/// removed.
+fn swap_shell(bundle: &Path, new: &str, dest: &Path) -> String {
     let src = shell_quote(&bundle.to_string_lossy());
     let bak = shell_quote(&sibling(bundle, "old").to_string_lossy());
-    let new = shell_quote(&new.to_string_lossy());
     let dst = shell_quote(&dest.to_string_lossy());
     format!(
-        "rm -rf {bak} && {{ [ ! -e {src} ] || mv -f {src} {bak}; }} && \
-         {{ mv -f {new} {dst} || {{ [ ! -e {bak} ] || mv -f {bak} {src}; false; }}; }} && \
-         rm -rf {bak}"
+        "/bin/rm -rf {bak} && {{ [ ! -e {src} ] || /bin/mv -f {src} {bak}; }} && \
+         {{ /bin/mv -f {new} {dst} || {{ [ ! -e {bak} ] || /bin/mv -f {bak} {src}; false; }}; }} && \
+         /bin/rm -rf {bak}"
     )
 }
+
+/// The shell command an administrator runs when no code signature check
+/// applies (the running app has no team): the old app moved aside, the new
+/// one moved in at `dest` (the old app's own path, or the current name
+/// beside it: [`install_destination`]), and the old one put back if that
+/// move fails, then the old one removed.
+pub fn admin_swap_shell(bundle: &Path, new: &Path, dest: &Path) -> String {
+    swap_shell(bundle, &shell_quote(&new.to_string_lossy()), dest)
+}
+
+/// The shell command an administrator runs for an app signed by `team`.
+/// `new` was checked already, but it sits in a folder this account owns,
+/// so a process of the same account could change it before root moves it.
+/// So root first takes its OWN copy, beside `dest`, runs
+/// `/usr/bin/codesign --verify --deep --strict` on that copy with the same
+/// requirement as the first check ([`crate::codesign::requirement`]), and
+/// swaps in that copy. A copy that fails is removed, nothing else moves,
+/// and the script exits [`ADMIN_UNVERIFIED`]. `Err` when `team` is not a
+/// Team ID.
+pub fn admin_swap_shell_checked(
+    bundle: &Path,
+    new: &Path,
+    dest: &Path,
+    team: &str,
+) -> Result<String, String> {
+    let requirement = shell_quote(&format!("-R={}", crate::codesign::requirement(team)?));
+    let copy = shell_quote(&sibling(dest, "update").to_string_lossy());
+    let new = shell_quote(&new.to_string_lossy());
+    let codesign = crate::codesign::CODESIGN;
+    let swap = swap_shell(bundle, &copy, dest);
+    Ok(format!(
+        "/bin/rm -rf {copy} && {DITTO} {new} {copy} && \
+         if ! {codesign} --verify --deep --strict {requirement} {copy}; then \
+         /bin/rm -rf {copy}; exit {ADMIN_UNVERIFIED}; fi && \
+         {{ {swap} || {{ /bin/rm -rf {copy}; false; }}; }}"
+    ))
+}
+
+/// Copies a bundle as it is, links and all.
+pub const DITTO: &str = "/usr/bin/ditto";
 
 /// One shell word, single-quoted.
 pub fn shell_quote(s: &str) -> String {
@@ -694,34 +736,71 @@ pub fn shell_quote(s: &str) -> String {
 
 /// The AppleScript run when the bundle's folder needs an administrator,
 /// with the paths quoted for the shell and then for AppleScript, so a name
-/// with an apostrophe or a double quote survives both.
-pub fn admin_swap_script(bundle: &Path, new: &Path, dest: &Path) -> String {
-    let shell = admin_swap_shell(bundle, new, dest);
+/// with an apostrophe or a double quote survives both. With a `team`, the
+/// script is [`admin_swap_shell_checked`]; without, [`admin_swap_shell`].
+pub fn admin_swap_script(
+    bundle: &Path,
+    new: &Path,
+    dest: &Path,
+    team: Option<&str>,
+) -> Result<String, String> {
+    let shell = match team {
+        Some(team) => admin_swap_shell_checked(bundle, new, dest, team)?,
+        None => admin_swap_shell(bundle, new, dest),
+    };
     let escaped = shell.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("do shell script \"{escaped}\" with administrator privileges")
+    Ok(format!(
+        "do shell script \"{escaped}\" with administrator privileges"
+    ))
 }
 
 /// Run [`admin_swap_script`] through /usr/bin/osascript: the system asks
 /// for an administrator's name and password, never this app. The new copy
-/// goes to [`install_destination`] of `bundle`.
+/// goes to [`install_destination`] of `bundle`. When `bundle` (the running
+/// app) is signed by a team, root checks its own copy of `new` against
+/// that team before the swap.
 pub fn admin_swap(bundle: &Path, new: &Path, names: &BundleNames) -> Result<(), InstallError> {
-    let status = std::process::Command::new("/usr/bin/osascript")
+    admin_swap_with(bundle, new, names, crate::codesign::platform())
+}
+
+/// [`admin_swap`] with the code signature tool that reads the running
+/// app's team supplied.
+pub fn admin_swap_with(
+    bundle: &Path,
+    new: &Path,
+    names: &BundleNames,
+    signing: &dyn CodeSignature,
+) -> Result<(), InstallError> {
+    let team = crate::codesign::expected_team(bundle, signing).map_err(InstallError::Signature)?;
+    let script = admin_swap_script(
+        bundle,
+        new,
+        &install_destination(bundle, names),
+        team.as_deref(),
+    )
+    .map_err(|detail| InstallError::Signature(SignatureError::RunningUnreadable { detail }))?;
+    let out = std::process::Command::new("/usr/bin/osascript")
         .arg("-e")
-        .arg(admin_swap_script(
-            bundle,
-            new,
-            &install_destination(bundle, names),
-        ))
-        .status()
+        .arg(script)
+        .output()
         .map_err(|e| {
             InstallError::NeedsAdmin(format!("Could not ask for an administrator: {e}"))
         })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(InstallError::NeedsAdmin(
+    if out.status.success() {
+        return Ok(());
+    }
+    // osascript ends its complaint with the script's exit status: "(5)".
+    let said = String::from_utf8_lossy(&out.stderr);
+    match team {
+        Some(team) if said.trim_end().ends_with(&format!("({ADMIN_UNVERIFIED})")) => {
+            Err(InstallError::Signature(SignatureError::Invalid {
+                team,
+                detail: "the copy the administrator step made failed the check".into(),
+            }))
+        }
+        _ => Err(InstallError::NeedsAdmin(
             "Failed to move the new app into place".into(),
-        ))
+        )),
     }
 }
 
@@ -784,7 +863,7 @@ mod tests {
     #[test]
     fn the_admin_script_survives_an_apostrophe_and_a_quote() {
         let bundle = Path::new("/Applications/Ann's \"Method Example\".app");
-        let s = admin_swap_script(bundle, Path::new("/tmp/new"), bundle);
+        let s = admin_swap_script(bundle, Path::new("/tmp/new"), bundle, None).unwrap();
         let shell = admin_swap_shell(bundle, Path::new("/tmp/new"), bundle);
         assert!(
             shell.contains(r#"'/Applications/Ann'\''s "Method Example".app'"#),
@@ -798,6 +877,92 @@ mod tests {
             )
         );
         // The shell form runs for real in tests/hostile_archive.rs.
+    }
+
+    /// Root takes its own copy, checks that copy, and only then swaps it
+    /// in; a copy that fails is removed before anything moves.
+    #[test]
+    fn the_administrator_step_checks_its_own_copy_before_the_swap() {
+        let bundle = Path::new("/Applications/Method Example.app");
+        let new = Path::new("/private/tmp/method-update-1/Method Example.app");
+        let script = admin_swap_shell_checked(bundle, new, bundle, "ABCDE12345").unwrap();
+        let at = |needle: &str| {
+            script
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {script}"))
+        };
+        let codesign = crate::codesign::CODESIGN;
+        assert!(at(DITTO) < at(codesign) && at(codesign) < at("/bin/mv"));
+        assert!(
+            script.contains(&shell_quote(
+                "-R=anchor apple generic and certificate leaf[subject.OU] = \"ABCDE12345\""
+            )),
+            "the same team requirement, quoted: {script}"
+        );
+        assert!(script.contains("--verify --deep --strict"));
+        assert!(script.contains("exit 5"));
+        // What moves in is root's copy, never the folder this account owns.
+        let copy = shell_quote(&sibling(bundle, "update").to_string_lossy());
+        assert!(script.contains(&format!("/bin/mv -f {copy} ")));
+        assert!(!script.contains(&format!(
+            "/bin/mv -f {}",
+            shell_quote(&new.to_string_lossy())
+        )));
+        // Nothing but a Team ID reaches root's script.
+        assert!(admin_swap_shell_checked(bundle, new, bundle, "X\" or anchor trusted").is_err());
+        assert!(admin_swap_script(bundle, new, bundle, Some("';rm -rf /;'")).is_err());
+        let apple = admin_swap_script(bundle, new, bundle, Some("ABCDE12345")).unwrap();
+        assert!(
+            apple.contains("subject.OU] = \\\"ABCDE12345\\\""),
+            "{apple}"
+        );
+    }
+
+    /// The script itself, run as this account in a scratch folder with
+    /// stand-ins for ditto and codesign.
+    #[cfg(unix)]
+    #[test]
+    fn the_administrator_script_refuses_a_copy_that_fails_and_installs_one_that_passes() {
+        let apps = tempfile::tempdir().unwrap();
+        let theirs = tempfile::tempdir().unwrap();
+        let bundle = apps.path().join("Method Example.app");
+        let new = theirs.path().join("Method Example.app");
+        let copy = sibling(&bundle, "update");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("v"), "old").unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("v"), "new").unwrap();
+        let run = |codesign: &str| {
+            let script = admin_swap_shell_checked(&bundle, &new, &bundle, "ABCDE12345")
+                .unwrap()
+                .replace(DITTO, "/bin/cp -R")
+                .replace(crate::codesign::CODESIGN, codesign);
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .status()
+                .unwrap()
+                .code()
+        };
+        assert_eq!(run("false"), Some(ADMIN_UNVERIFIED));
+        assert_eq!(std::fs::read_to_string(bundle.join("v")).unwrap(), "old");
+        assert!(!copy.exists(), "the failed copy is removed");
+        assert!(!sibling(&bundle, "old").exists(), "nothing moved");
+
+        // The copy root checks is the one it took: a swap of the source
+        // AFTER the copy (here, by the stand-in for codesign itself, which
+        // runs after ditto) never reaches the installed app.
+        let swap = format!(
+            "/bin/sh -c 'echo swapped > \"$0\"' {}",
+            shell_quote(&new.join("v").to_string_lossy())
+        );
+        assert_eq!(run(&format!("{swap} && true")), Some(0));
+        assert_eq!(std::fs::read_to_string(new.join("v")).unwrap(), "swapped\n");
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("v")).unwrap(),
+            "new",
+            "the checked copy went in"
+        );
+        assert!(!copy.exists() && !sibling(&bundle, "old").exists());
     }
 
     #[test]

@@ -12,9 +12,19 @@
 //!
 //! A running app that is unsigned, ad-hoc signed or signed without a team
 //! (a development build, a test) has no team to compare with: the check is
-//! skipped and says so on stderr. So does a running bundle `codesign`
-//! cannot read at all. Only the running app decides this, never the
-//! download, so a download can not switch the check off.
+//! skipped and says so on stderr. A running bundle `codesign` cannot read
+//! at all is skipped only when it carries no signature seal
+//! (`Contents/_CodeSignature/CodeResources`); with one, it claims to be
+//! signed, and the update is refused ([`SignatureError::RunningUnreadable`])
+//! so a signed release can never drop into the skip. Only the running app
+//! decides this, never the download, so a download can not switch the
+//! check off.
+//!
+//! When an administrator does the swap, root checks again: its script
+//! takes its own copy of the new bundle and runs the same `codesign`
+//! requirement on that copy before anything moves
+//! ([`crate::install::admin_swap_shell_checked`]), so what root installs
+//! is what root checked.
 //!
 //! The tool is the [`CodeSignature`] trait, so tests can stand in for
 //! `/usr/bin/codesign` without signed bundles. [`platform`] is the real
@@ -63,6 +73,9 @@ pub enum SignatureError {
         expected: String,
         found: Option<String>,
     },
+    /// The running app carries a signature seal, but its signature could
+    /// not be read, so there is no team to hold the update to.
+    RunningUnreadable { detail: String },
 }
 
 impl std::fmt::Display for SignatureError {
@@ -85,6 +98,10 @@ impl std::fmt::Display for SignatureError {
             } => write!(
                 f,
                 "The update is not signed by team {expected} that signed this app, so it was not installed."
+            ),
+            Self::RunningUnreadable { detail } => write!(
+                f,
+                "This app's own code signature could not be read, so the update was not installed: {detail}"
             ),
         }
     }
@@ -211,6 +228,41 @@ pub fn parse_display(ok: bool, text: &str) -> Result<Signing, String> {
     }
 }
 
+/// The seal a signed bundle carries, relative to the bundle.
+pub const SEAL: &str = "Contents/_CodeSignature/CodeResources";
+
+/// The team an update of `running` must carry: `Ok(Ok(team))`, or
+/// `Ok(Err(why))` when there is none to compare with and the check is
+/// skipped. A bundle the tool cannot read is skipped only without a
+/// [`SEAL`]; with one it is refused.
+fn expected(
+    running: &Path,
+    tool: &dyn CodeSignature,
+) -> Result<Result<String, String>, SignatureError> {
+    Ok(Err(match tool.signing(running) {
+        Ok(Signing::Team(team)) => return Ok(Ok(team)),
+        Ok(Signing::AdHoc) => "the running app is ad-hoc signed".into(),
+        Ok(Signing::NoTeam) => "the running app is signed without a team".into(),
+        Ok(Signing::Unsigned) => "the running app is not signed".into(),
+        Ok(Signing::Unsupported) => "this platform has no code signature check".into(),
+        Err(detail) => {
+            if std::fs::symlink_metadata(running.join(SEAL)).is_ok() {
+                return Err(SignatureError::RunningUnreadable { detail });
+            }
+            format!("the running app has no signature to read ({detail})")
+        }
+    }))
+}
+
+/// The team an update of `running` must carry, or `None` when the check is
+/// skipped (the rule of [`check_update`]).
+pub fn expected_team(
+    running: &Path,
+    tool: &dyn CodeSignature,
+) -> Result<Option<String>, SignatureError> {
+    expected(running, tool).map(Result::ok)
+}
+
 /// The check: `staged` (the unpacked update) against `running` (the bundle
 /// it replaces, which this app runs from). `Ok` means the swap may go on;
 /// [`Checked::Skipped`] says why nothing was compared.
@@ -219,21 +271,9 @@ pub fn check_update(
     staged: &Path,
     tool: &dyn CodeSignature,
 ) -> Result<Checked, SignatureError> {
-    let team = match tool.signing(running) {
-        Ok(Signing::Team(team)) => team,
-        Ok(other) => {
-            return Ok(Checked::Skipped(match other {
-                Signing::AdHoc => "the running app is ad-hoc signed".into(),
-                Signing::NoTeam => "the running app is signed without a team".into(),
-                Signing::Unsigned => "the running app is not signed".into(),
-                _ => "this platform has no code signature check".into(),
-            }));
-        }
-        Err(e) => {
-            return Ok(Checked::Skipped(format!(
-                "the running app's signature could not be read ({e})"
-            )));
-        }
+    let team = match expected(running, tool)? {
+        Ok(team) => team,
+        Err(why) => return Ok(Checked::Skipped(why)),
     };
     tool.verify(staged, &team)
         .map_err(|detail| SignatureError::Invalid {
@@ -410,6 +450,76 @@ mod tests {
             Checked::Skipped("the running app is not signed".into())
         );
         assert!(check_and_say(&r, &s, &NoCheck).is_ok());
+    }
+
+    /// A bundle folder on disk, with or without the signature seal.
+    fn bundle_on_disk(dir: &Path, sealed: bool) -> PathBuf {
+        let app = dir.join("Method Example.app");
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        if sealed {
+            std::fs::create_dir_all(app.join("Contents/_CodeSignature")).unwrap();
+            std::fs::write(app.join(SEAL), b"<plist/>").unwrap();
+        }
+        app
+    }
+
+    #[test]
+    fn a_sealed_running_app_codesign_cannot_read_refuses_the_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = bundle_on_disk(dir.path(), true);
+        let staged = dir.path().join("staged.app");
+        let mut f = Fake::default();
+        f.signing
+            .insert(running.clone(), Err("a sealed resource is missing".into()));
+        // Even an update that would pass is refused: no team to hold it to.
+        f.signing
+            .insert(staged.clone(), Ok(Signing::Team("ABCDE12345".into())));
+        f.valid.insert(staged.clone(), true);
+        let err = check_update(&running, &staged, &f).unwrap_err();
+        assert_eq!(
+            err,
+            SignatureError::RunningUnreadable {
+                detail: "a sealed resource is missing".into()
+            }
+        );
+        assert!(err.to_string().contains("could not be read"));
+        assert!(expected_team(&running, &f).is_err());
+        assert_eq!(f.asked.lock().unwrap().len(), 2, "the update is never read");
+    }
+
+    #[test]
+    fn an_unsealed_running_app_codesign_cannot_read_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = bundle_on_disk(dir.path(), false);
+        let staged = dir.path().join("staged.app");
+        let mut f = Fake::default();
+        f.signing
+            .insert(running.clone(), Err("bundle format unrecognized".into()));
+        assert!(matches!(
+            check_update(&running, &staged, &f),
+            Ok(Checked::Skipped(_))
+        ));
+        assert_eq!(expected_team(&running, &f), Ok(None));
+    }
+
+    #[test]
+    fn a_sealed_development_build_still_skips() {
+        // Unsigned, ad-hoc and team-less builds are read fine (`Ok`), seal
+        // or not: they keep working.
+        let dir = tempfile::tempdir().unwrap();
+        let running = bundle_on_disk(dir.path(), true);
+        for signing in [Signing::AdHoc, Signing::NoTeam, Signing::Unsigned] {
+            let mut f = Fake::default();
+            f.signing.insert(running.clone(), Ok(signing));
+            assert!(matches!(
+                check_update(&running, Path::new("/staged"), &f),
+                Ok(Checked::Skipped(_))
+            ));
+        }
+        let mut f = Fake::default();
+        f.signing
+            .insert(running.clone(), Ok(Signing::Team("ABCDE12345".into())));
+        assert_eq!(expected_team(&running, &f), Ok(Some("ABCDE12345".into())));
     }
 
     #[test]
