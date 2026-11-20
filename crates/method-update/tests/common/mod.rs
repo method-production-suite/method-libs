@@ -25,6 +25,15 @@ pub fn names() -> BundleNames {
     BundleNames::new(CURRENT).with_legacy(LEGACY)
 }
 
+/// The administrator's shell command, made runnable by this account in a
+/// scratch folder: only root can give a file to root, and ditto is a Mac
+/// tool, so chown does nothing here and cp stands in for ditto. The order
+/// and the ownership are tested beside the script, in src/install.rs.
+pub fn as_this_account(script: &str) -> String {
+    use method_update::install::{CHOWN, DITTO};
+    script.replace(DITTO, "/bin/cp -R").replace(CHOWN, "true")
+}
+
 pub fn b64(s: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(s)
 }

@@ -20,7 +20,9 @@ suite's update behaviour built in.
   `CFBundleExecutable` exists before anything moves. A failure after the running bundle
   moved puts it back. A backup that can't be deleted is reported as `leftover`, not as a
   failure. When /Applications isn't writable, an administrator does the swap through
-  osascript. An app that was renamed can name its old bundle, and the next update moves
+  osascript: root takes its own copy of the new bundle, gives it to `root:wheel` with no
+  write permission for group or others, and swaps that copy in, so the account that asked
+  cannot change the installed app afterwards. An app that was renamed can name its old bundle, and the next update moves
   it to the new name, once.
 - **Code signature** (`method_update::codesign`): on a Mac, before the running bundle
   moves, the unpacked update must pass `/usr/bin/codesign --verify --deep --strict`
@@ -32,8 +34,9 @@ suite's update behaviour built in.
   running app codesign cannot read at all is skipped only when it has no
   `Contents/_CodeSignature/CodeResources`; with that file it claims to be signed, and the
   update is refused. When an administrator does the swap, root takes its own copy of the
-  new bundle, runs the same codesign requirement on that copy, and swaps in that copy, so
-  nothing changed after the first check can be installed. Windows and Linux check nothing
+  new bundle, makes the copy its own (`chown -R root:wheel`, `chmod -R go-w`), runs the
+  same codesign requirement on that copy, and swaps in that copy, so nothing changed after
+  the first check can be installed. Windows and Linux check nothing
   yet; `install_app_with` takes any `CodeSignature` tool.
 - **Restart**: starts `Installed::bundle` (the new path after a rename), reading
   `CFBundleExecutable` from the NEW Info.plist.

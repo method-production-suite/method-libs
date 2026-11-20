@@ -194,7 +194,9 @@ fn an_old_bundle_that_cannot_be_deleted_is_left_over_beside_the_new_one() {
 fn run_admin_shell(bundle: &Path, new: &Path, dest: &Path) -> bool {
     std::process::Command::new("/bin/sh")
         .arg("-c")
-        .arg(method_update::install::admin_swap_shell(bundle, new, dest))
+        .arg(common::as_this_account(
+            &method_update::install::admin_swap_shell(bundle, new, dest),
+        ))
         .status()
         .unwrap()
         .success()

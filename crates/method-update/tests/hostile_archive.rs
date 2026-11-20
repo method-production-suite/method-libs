@@ -143,8 +143,8 @@ fn a_link_that_stays_inside_the_bundle_is_kept() {
 fn run_admin_shell(bundle: &Path, new: &Path) -> bool {
     std::process::Command::new("/bin/sh")
         .arg("-c")
-        .arg(method_update::install::admin_swap_shell(
-            bundle, new, bundle,
+        .arg(common::as_this_account(
+            &method_update::install::admin_swap_shell(bundle, new, bundle),
         ))
         .status()
         .unwrap()
