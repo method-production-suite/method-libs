@@ -17,7 +17,9 @@
 //! [`Installed::leftover`], not as a failure: the new bundle is in place.
 //! When /Applications is not writable, an administrator does the swap
 //! through osascript ([`admin_swap`]), with the paths quoted for the shell
-//! and for AppleScript.
+//! and for AppleScript. What that path installs belongs to root:wheel with
+//! no write permission for group or others, so the account that asked
+//! cannot change the app afterwards without an administrator.
 //!
 //! One swap renames as well, for an app that has a legacy bundle name
 //! ([`BundleNames::legacy`]). When the running bundle has that legacy name
@@ -671,7 +673,7 @@ pub fn touch(path: &Path) {
 }
 
 /// What the administrator's script exits with when root's own copy of the
-/// new bundle fails the code signature check.
+/// new bundle could not be made root's or fails the code signature check.
 pub const ADMIN_UNVERIFIED: i32 = 5;
 
 /// The swap itself, as shell: the old app moved aside, `new` moved in at
@@ -689,24 +691,85 @@ fn swap_shell(bundle: &Path, new: &str, dest: &Path) -> String {
     )
 }
 
+/// Where root's copy sits inside root's private folder (`$d` in the
+/// script), as shell: the folder, then the bundle under `dest`'s own name.
+fn private_copy(dest: &Path) -> String {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("\"$d\"/{}", shell_quote(&name))
+}
+
+/// Root's own copy of `new`, prepared in a private folder. Root makes a
+/// fresh folder beside `dest` with `/usr/bin/mktemp -d` (root's, mode 700,
+/// so no other account can open anything in it; beside `dest`, so the move
+/// into place is a rename on one volume), copies `new` into it with
+/// [`DITTO`], then runs `/usr/sbin/chown -R -h root:wheel` and
+/// `/bin/chmod -R go-w` on the copy. ditto keeps the owner of what it
+/// copies, so without this the installed app would belong to the account
+/// that staged it, and any process of that account could then change an
+/// app in a folder only an administrator can write. The owner is always
+/// [`ADMIN_OWNER`], whoever owned the app being replaced: an app that an
+/// earlier version left owned by the account is put right by its next
+/// update. When the folder cannot be made or the copy cannot be taken, the
+/// script fails; a copy that cannot be made root's exits
+/// [`ADMIN_UNVERIFIED`], as for a failed check. Either way the private
+/// folder is removed and nothing else moves.
+fn take_copy_shell(new: &str, dest: &Path) -> String {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let template = shell_quote(
+        &dest
+            .with_file_name(format!(".{name}.admin.XXXXXXXX"))
+            .to_string_lossy(),
+    );
+    let copy = private_copy(dest);
+    format!(
+        "d=$({MKTEMP} -d {template}) && [ -d \"$d\" ] || exit 1; \
+         {{ {DITTO} {new} {copy} || {{ /bin/rm -rf \"$d\"; false; }}; }} && \
+         if ! {{ {CHOWN} -R -h {ADMIN_OWNER} {copy} && {CHMOD} -R go-w {copy}; }}; then \
+         /bin/rm -rf \"$d\"; exit {ADMIN_UNVERIFIED}; fi"
+    )
+}
+
+/// Root's copy moved out of its private folder into place with
+/// [`swap_shell`], and the private folder removed whether that worked or
+/// not.
+fn swap_out_shell(bundle: &Path, dest: &Path) -> String {
+    let swap = swap_shell(bundle, &private_copy(dest), dest);
+    format!("{{ {swap} || {{ /bin/rm -rf \"$d\"; false; }}; }} && /bin/rm -rf \"$d\"")
+}
+
 /// The shell command an administrator runs when no code signature check
-/// applies (the running app has no team): the old app moved aside, the new
-/// one moved in at `dest` (the old app's own path, or the current name
-/// beside it: [`install_destination`]), and the old one put back if that
-/// move fails, then the old one removed.
+/// applies (the running app has no team): root prepares its own copy of
+/// `new` in a private folder beside `dest` and makes it root's
+/// ([`ADMIN_OWNER`], no write for group or others), then the old app is
+/// moved aside, the copy moved in at `dest` (the old app's own path, or the
+/// current name beside it: [`install_destination`]), and the old one put
+/// back if that move fails, then the old one and the private folder
+/// removed.
 pub fn admin_swap_shell(bundle: &Path, new: &Path, dest: &Path) -> String {
-    swap_shell(bundle, &shell_quote(&new.to_string_lossy()), dest)
+    let take = take_copy_shell(&shell_quote(&new.to_string_lossy()), dest);
+    let swap = swap_out_shell(bundle, dest);
+    format!("{take} && {swap}")
 }
 
 /// The shell command an administrator runs for an app signed by `team`.
-/// `new` was checked already, but it sits in a folder this account owns,
-/// so a process of the same account could change it before root moves it.
-/// So root first takes its OWN copy, beside `dest`, runs
-/// `/usr/bin/codesign --verify --deep --strict` on that copy with the same
-/// requirement as the first check ([`crate::codesign::requirement`]), and
-/// swaps in that copy. A copy that fails is removed, nothing else moves,
-/// and the script exits [`ADMIN_UNVERIFIED`]. `Err` when `team` is not a
-/// Team ID.
+/// `new` was checked already, but it sits in a folder this account owns.
+/// So root prepares and checks its OWN copy in a private folder: a fresh
+/// folder beside `dest` that only root can open (`/usr/bin/mktemp -d`),
+/// the copy taken into it and made root's ([`ADMIN_OWNER`], no write for
+/// group or others), then `/usr/bin/codesign --verify --deep --strict` on
+/// that copy with the same requirement as the first check
+/// ([`crate::codesign::requirement`]). Only then is that copy moved out of
+/// the folder and swapped in, and the folder removed. Who owns a file is
+/// not part of its code signature, so the check reads the same. A copy
+/// that fails, or that could not be made root's, is removed with its
+/// folder, nothing else moves, and the script exits [`ADMIN_UNVERIFIED`].
+/// `Err` when `team` is not a Team ID.
 pub fn admin_swap_shell_checked(
     bundle: &Path,
     new: &Path,
@@ -714,20 +777,33 @@ pub fn admin_swap_shell_checked(
     team: &str,
 ) -> Result<String, String> {
     let requirement = shell_quote(&format!("-R={}", crate::codesign::requirement(team)?));
-    let copy = shell_quote(&sibling(dest, "update").to_string_lossy());
-    let new = shell_quote(&new.to_string_lossy());
+    let copy = private_copy(dest);
+    let take = take_copy_shell(&shell_quote(&new.to_string_lossy()), dest);
     let codesign = crate::codesign::CODESIGN;
-    let swap = swap_shell(bundle, &copy, dest);
+    let swap = swap_out_shell(bundle, dest);
     Ok(format!(
-        "/bin/rm -rf {copy} && {DITTO} {new} {copy} && \
+        "{take} && \
          if ! {codesign} --verify --deep --strict {requirement} {copy}; then \
-         /bin/rm -rf {copy}; exit {ADMIN_UNVERIFIED}; fi && \
-         {{ {swap} || {{ /bin/rm -rf {copy}; false; }}; }}"
+         /bin/rm -rf \"$d\"; exit {ADMIN_UNVERIFIED}; fi && \
+         {swap}"
     ))
 }
 
+/// Makes root's private folder: new, root's, mode 700.
+pub const MKTEMP: &str = "/usr/bin/mktemp";
+
 /// Copies a bundle as it is, links and all.
 pub const DITTO: &str = "/usr/bin/ditto";
+
+/// Changes who owns root's copy.
+pub const CHOWN: &str = "/usr/sbin/chown";
+
+/// Takes write permission on root's copy away from group and others.
+pub const CHMOD: &str = "/bin/chmod";
+
+/// Who owns an app an administrator installed: what an installer run by an
+/// administrator leaves.
+pub const ADMIN_OWNER: &str = "root:wheel";
 
 /// One shell word, single-quoted.
 pub fn shell_quote(s: &str) -> String {
@@ -795,7 +871,9 @@ pub fn admin_swap_with(
         Some(team) if said.trim_end().ends_with(&format!("({ADMIN_UNVERIFIED})")) => {
             Err(InstallError::Signature(SignatureError::Invalid {
                 team,
-                detail: "the copy the administrator step made failed the check".into(),
+                detail: "the copy the administrator step made could not be made the \
+                         administrator's own, or failed the check"
+                    .into(),
             }))
         }
         _ => Err(InstallError::NeedsAdmin(
@@ -892,7 +970,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{needle} in {script}"))
         };
         let codesign = crate::codesign::CODESIGN;
-        assert!(at(DITTO) < at(codesign) && at(codesign) < at("/bin/mv"));
+        assert!(at(DITTO) < at(CHOWN) && at(CHOWN) < at(codesign));
+        assert!(at(codesign) < at("/bin/mv"));
         assert!(
             script.contains(&shell_quote(
                 "-R=anchor apple generic and certificate leaf[subject.OU] = \"ABCDE12345\""
@@ -902,8 +981,24 @@ mod tests {
         assert!(script.contains("--verify --deep --strict"));
         assert!(script.contains("exit 5"));
         // What moves in is root's copy, never the folder this account owns.
-        let copy = shell_quote(&sibling(bundle, "update").to_string_lossy());
+        let copy = "\"$d\"/'Method Example.app'";
         assert!(script.contains(&format!("/bin/mv -f {copy} ")));
+        assert!(
+            script.starts_with(
+                "d=$(/usr/bin/mktemp -d '/Applications/.Method Example.app.admin.XXXXXXXX')"
+            ),
+            "a private folder beside the app, made first: {script}"
+        );
+        assert!(script.contains(&format!(
+            "{DITTO} {} {copy} ",
+            shell_quote(&new.to_string_lossy())
+        )));
+        assert!(script.contains(&format!(
+            "{requirement} {copy};",
+            requirement = shell_quote(
+                "-R=anchor apple generic and certificate leaf[subject.OU] = \"ABCDE12345\""
+            )
+        )));
         assert!(!script.contains(&format!(
             "/bin/mv -f {}",
             shell_quote(&new.to_string_lossy())
@@ -918,35 +1013,172 @@ mod tests {
         );
     }
 
-    /// The script itself, run as this account in a scratch folder with
-    /// stand-ins for ditto and codesign.
+    /// A scratch Applications folder, a staged bundle in another folder,
+    /// and stand-ins for the tools root's script calls. Each stand-in
+    /// writes its name to a log, so a test can read the order they ran in;
+    /// chown, chmod and rm also log their arguments (this account cannot
+    /// give a file to root, so chown only logs).
     #[cfg(unix)]
-    #[test]
-    fn the_administrator_script_refuses_a_copy_that_fails_and_installs_one_that_passes() {
-        let apps = tempfile::tempdir().unwrap();
-        let theirs = tempfile::tempdir().unwrap();
-        let bundle = apps.path().join("Method Example.app");
-        let new = theirs.path().join("Method Example.app");
-        let copy = sibling(&bundle, "update");
-        std::fs::create_dir_all(&bundle).unwrap();
-        std::fs::write(bundle.join("v"), "old").unwrap();
-        std::fs::create_dir_all(&new).unwrap();
-        std::fs::write(new.join("v"), "new").unwrap();
-        let run = |codesign: &str| {
-            let script = admin_swap_shell_checked(&bundle, &new, &bundle, "ABCDE12345")
+    struct Scratch {
+        apps: tempfile::TempDir,
+        theirs: tempfile::TempDir,
+        tools: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl Scratch {
+        fn new(old: bool) -> Self {
+            let s = Scratch {
+                apps: tempfile::tempdir().unwrap(),
+                theirs: tempfile::tempdir().unwrap(),
+                tools: tempfile::tempdir().unwrap(),
+            };
+            if old {
+                std::fs::create_dir_all(s.bundle()).unwrap();
+                std::fs::write(s.bundle().join("v"), "old").unwrap();
+            }
+            std::fs::create_dir_all(s.staged()).unwrap();
+            std::fs::write(s.staged().join("v"), "new").unwrap();
+            s
+        }
+        fn bundle(&self) -> PathBuf {
+            self.apps.path().join("Method Example.app")
+        }
+        fn staged(&self) -> PathBuf {
+            self.theirs.path().join("Method Example.app")
+        }
+        /// What is in the Applications folder.
+        fn beside(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(self.apps.path())
                 .unwrap()
-                .replace(DITTO, "/bin/cp -R")
-                .replace(crate::codesign::CODESIGN, codesign);
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+        /// What the stand-ins logged, with the private folder's path
+        /// written `$d` and the backup's `$old`.
+        fn log(&self) -> Vec<String> {
+            let d = std::fs::read_to_string(self.tools.path().join("staging")).unwrap_or_default();
+            let d = d.trim_end();
+            let old = sibling(&self.bundle(), "old");
+            std::fs::read_to_string(self.tools.path().join("log"))
+                .unwrap_or_default()
+                .lines()
+                .map(|l| {
+                    let l = l.replace(&*old.to_string_lossy(), "$old");
+                    if d.is_empty() { l } else { l.replace(d, "$d") }
+                })
+                .collect()
+        }
+        /// A stand-in tool: logs `name` (and its arguments when `args`),
+        /// then runs `then`.
+        fn tool(&self, name: &str, args: bool, then: &str) -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.tools.path().join(name);
+            let log = self.logfile();
+            let line = if args {
+                format!("echo \"{name} $*\" >> {log}")
+            } else {
+                format!("echo {name} >> {log}")
+            };
+            std::fs::write(&path, format!("#!/bin/sh\n{line}\n{then}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            shell_quote(&path.to_string_lossy())
+        }
+        fn logfile(&self) -> String {
+            shell_quote(&self.tools.path().join("log").to_string_lossy())
+        }
+        /// Run `script` with the stand-ins in place of the real tools.
+        /// `fail` names the one tool that fails ("" for none); `codesign`
+        /// is what the codesign stand-in does when it is not the one.
+        fn run_with(&self, script: &str, fail: &str, codesign: &str) -> Option<i32> {
+            let _ = std::fs::remove_file(self.tools.path().join("log"));
+            let _ = std::fs::remove_file(self.tools.path().join("staging"));
+            let does = |name: &str, then: &str| {
+                if fail == name {
+                    "exit 1".to_owned()
+                } else {
+                    then.to_owned()
+                }
+            };
+            // mktemp for real, its answer kept for the test to read. ditto
+            // also logs the mode of the folder it copies into.
+            let staging = shell_quote(&self.tools.path().join("staging").to_string_lossy());
+            let mktemp =
+                format!("d=$(mktemp \"$@\") || exit 1\necho \"$d\" > {staging}\necho \"$d\"");
+            let ditto = format!(
+                "echo \"into $(ls -ld \"$(dirname \"$2\")\" | cut -c1-10)\" >> {}\nexec /bin/cp -R \"$@\"",
+                self.logfile()
+            );
+            let script = script
+                .replace(
+                    MKTEMP,
+                    &self.tool("mktemp", false, &does("mktemp", &mktemp)),
+                )
+                .replace(DITTO, &self.tool("ditto", false, &does("ditto", &ditto)))
+                .replace(CHOWN, &self.tool("chown", true, &does("chown", "true")))
+                .replace(
+                    crate::codesign::CODESIGN,
+                    &self.tool("codesign", false, &does("codesign", codesign)),
+                )
+                .replace(CHMOD, &self.tool("chmod", true, &does("chmod", "true")))
+                .replace("/bin/mv", &self.tool("mv", false, "exec /bin/mv \"$@\""))
+                .replace("/bin/rm", &self.tool("rm", true, "exec /bin/rm \"$@\""));
             std::process::Command::new("/bin/sh")
                 .args(["-c", &script])
                 .status()
                 .unwrap()
                 .code()
-        };
-        assert_eq!(run("false"), Some(ADMIN_UNVERIFIED));
-        assert_eq!(std::fs::read_to_string(bundle.join("v")).unwrap(), "old");
-        assert!(!copy.exists(), "the failed copy is removed");
-        assert!(!sibling(&bundle, "old").exists(), "nothing moved");
+        }
+        fn run(&self, script: &str, fail: &str) -> Option<i32> {
+            self.run_with(script, fail, "true")
+        }
+        fn checked(&self) -> String {
+            admin_swap_shell_checked(&self.bundle(), &self.staged(), &self.bundle(), "ABCDE12345")
+                .unwrap()
+        }
+        fn unchecked(&self) -> String {
+            admin_swap_shell(&self.bundle(), &self.staged(), &self.bundle())
+        }
+        fn installed(&self) -> String {
+            std::fs::read_to_string(self.bundle().join("v")).unwrap_or_default()
+        }
+    }
+
+    /// What the stand-ins log for root preparing its copy: the private
+    /// folder (mode 700), the copy into it, and root's ownership of it.
+    #[cfg(unix)]
+    const PREPARED: [&str; 5] = [
+        "mktemp",
+        "ditto",
+        "into drwx------",
+        "chown -R -h root:wheel $d/Method Example.app",
+        "chmod -R go-w $d/Method Example.app",
+    ];
+    /// And for the swap of an app that was there, then the private folder
+    /// removed: the old backup cleared, the old app aside, the copy moved
+    /// out into place, the backup removed, the folder removed.
+    #[cfg(unix)]
+    const SWAPPED: [&str; 5] = ["rm -rf $old", "mv", "mv", "rm -rf $old", "rm -rf $d"];
+    #[cfg(unix)]
+    const APP: &str = "Method Example.app";
+
+    /// The script itself, run as this account in a scratch folder with
+    /// stand-ins for the tools.
+    #[cfg(unix)]
+    #[test]
+    fn the_administrator_script_refuses_a_copy_that_fails_and_installs_one_that_passes() {
+        let s = Scratch::new(true);
+        let new = s.staged();
+        assert_eq!(s.run(&s.checked(), "codesign"), Some(ADMIN_UNVERIFIED));
+        assert_eq!(s.installed(), "old");
+        assert_eq!(
+            s.beside(),
+            [APP],
+            "the failed copy and its folder are removed"
+        );
+        assert!(!s.log().contains(&"mv".to_owned()), "nothing moved");
 
         // The copy root checks is the one it took: a swap of the source
         // AFTER the copy (here, by the stand-in for codesign itself, which
@@ -955,14 +1187,173 @@ mod tests {
             "/bin/sh -c 'echo swapped > \"$0\"' {}",
             shell_quote(&new.join("v").to_string_lossy())
         );
-        assert_eq!(run(&format!("{swap} && true")), Some(0));
+        assert_eq!(s.run_with(&s.checked(), "", &swap), Some(0));
         assert_eq!(std::fs::read_to_string(new.join("v")).unwrap(), "swapped\n");
-        assert_eq!(
-            std::fs::read_to_string(bundle.join("v")).unwrap(),
-            "new",
-            "the checked copy went in"
-        );
-        assert!(!copy.exists() && !sibling(&bundle, "old").exists());
+        assert_eq!(s.installed(), "new", "the checked copy went in");
+        assert_eq!(s.beside(), [APP]);
+    }
+
+    /// Root prepares and checks its copy in a private folder, and only
+    /// then moves anything: mktemp, ditto, chown, chmod, codesign, the
+    /// swap (which moves the copy out), and the folder removed.
+    #[cfg(unix)]
+    #[test]
+    fn the_administrator_script_prepares_and_checks_in_a_private_folder_before_the_swap() {
+        let s = Scratch::new(true);
+        assert_eq!(s.run(&s.checked(), ""), Some(0));
+        let mut want = PREPARED.to_vec();
+        want.push("codesign");
+        want.extend(SWAPPED);
+        assert_eq!(s.log(), want);
+        assert_eq!(s.installed(), "new");
+        assert_eq!(s.beside(), [APP], "nothing left beside the app");
+
+        // The same order as text, with the real tools' full paths.
+        let script = s.checked();
+        let at = |needle: &str| {
+            script
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {script}"))
+        };
+        let codesign = crate::codesign::CODESIGN;
+        assert!(at("/usr/bin/mktemp -d ") < at(DITTO));
+        assert!(at(DITTO) < at("/usr/sbin/chown -R -h root:wheel \"$d\"/"));
+        assert!(at("/usr/sbin/chown") < at("/bin/chmod -R go-w \"$d\"/"));
+        assert!(at("/bin/chmod") < at(codesign) && at(codesign) < at("/bin/mv"));
+        assert!(script.ends_with("&& /bin/rm -rf \"$d\""), "{script}");
+    }
+
+    /// A first install through the administrator path: nothing to move
+    /// aside, and what goes in is still root's.
+    #[cfg(unix)]
+    #[test]
+    fn the_administrator_script_installs_as_root_when_there_is_no_old_bundle() {
+        for checked in [true, false] {
+            let s = Scratch::new(false);
+            let script = if checked { s.checked() } else { s.unchecked() };
+            assert_eq!(s.run(&script, ""), Some(0), "{script}");
+            let mut want = PREPARED.to_vec();
+            if checked {
+                want.push("codesign");
+            }
+            // One move: there is no old app to set aside.
+            want.extend(["rm -rf $old", "mv", "rm -rf $old", "rm -rf $d"]);
+            assert_eq!(s.log(), want);
+            assert_eq!(s.installed(), "new");
+            assert_eq!(s.beside(), [APP]);
+        }
+    }
+
+    /// An app an earlier version left owned by this account (here, every
+    /// file in the scratch folder is) is not copied in its ownership: the
+    /// script never reads who owned the old bundle, and the new one is
+    /// root's.
+    #[cfg(unix)]
+    #[test]
+    fn an_old_bundle_this_account_owns_is_replaced_by_one_root_owns() {
+        use std::os::unix::fs::MetadataExt;
+        let s = Scratch::new(true);
+        let me = std::fs::metadata(s.theirs.path()).unwrap().uid();
+        assert_eq!(std::fs::metadata(s.bundle()).unwrap().uid(), me);
+        for script in [s.checked(), s.unchecked()] {
+            assert!(!script.contains("stat"), "{script}");
+            assert_eq!(
+                script.matches("/usr/sbin/chown -R -h root:wheel ").count(),
+                1,
+                "{script}"
+            );
+            assert_eq!(s.run(&script, ""), Some(0));
+            assert_eq!(s.log()[..5], PREPARED);
+            assert_eq!(s.installed(), "new");
+            assert_eq!(s.beside(), [APP]);
+        }
+    }
+
+    /// Whatever fails while root prepares or checks its copy, the private
+    /// folder is removed, nothing moves, and nothing is left beside the
+    /// app. A copy root could not make its own, or one that fails the
+    /// check, exits as a failed check; no folder or no copy is a plain
+    /// failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_before_the_swap_removes_the_private_folder_and_moves_nothing() {
+        for checked in [true, false] {
+            for (fail, code, ran) in [
+                ("mktemp", 1, 1),
+                ("ditto", 1, 2),
+                ("chown", ADMIN_UNVERIFIED, 4),
+                ("chmod", ADMIN_UNVERIFIED, 5),
+                ("codesign", ADMIN_UNVERIFIED, 6),
+            ] {
+                if fail == "codesign" && !checked {
+                    continue;
+                }
+                let s = Scratch::new(true);
+                let script = if checked { s.checked() } else { s.unchecked() };
+                assert_eq!(s.run(&script, fail), Some(code), "{fail}");
+                let log = s.log();
+                let mut want: Vec<&str> = PREPARED.to_vec();
+                want.push("codesign");
+                want.truncate(ran);
+                if fail == "ditto" {
+                    want.truncate(2);
+                }
+                if fail != "mktemp" {
+                    want.push("rm -rf $d");
+                }
+                assert_eq!(log, want, "{fail}: the folder removed and no move");
+                assert_eq!(s.installed(), "old", "{fail}");
+                assert_eq!(s.beside(), [APP], "{fail}: nothing left beside the app");
+            }
+        }
+    }
+
+    /// The script for an app with no team: root's own copy, prepared in a
+    /// private folder and made root's, then the swap. The folder this
+    /// account staged the update in is never what moves in.
+    #[cfg(unix)]
+    #[test]
+    fn the_unchecked_administrator_script_also_installs_a_copy_root_owns() {
+        let s = Scratch::new(true);
+        let script = s.unchecked();
+        assert!(!script.contains(crate::codesign::CODESIGN), "{script}");
+        assert!(!script.contains(&format!(
+            "/bin/mv -f {}",
+            shell_quote(&s.staged().to_string_lossy())
+        )));
+        assert_eq!(s.run(&script, ""), Some(0));
+        let mut want = PREPARED.to_vec();
+        want.extend(SWAPPED);
+        assert_eq!(s.log(), want);
+        assert_eq!(s.installed(), "new");
+        assert!(s.staged().join("v").is_file(), "the staged folder is left");
+        assert_eq!(s.beside(), [APP]);
+    }
+
+    /// A name with a space and an apostrophe survives the private folder's
+    /// template and the copy's path, run for real.
+    #[cfg(unix)]
+    #[test]
+    fn the_private_folder_works_beside_a_name_with_a_space_and_an_apostrophe() {
+        let apps = tempfile::tempdir().unwrap();
+        let theirs = tempfile::tempdir().unwrap();
+        let bundle = apps.path().join("Ann's Method Example.app");
+        let new = theirs.path().join("staged copy.app");
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("v"), "new").unwrap();
+        let script = admin_swap_shell_checked(&bundle, &new, &bundle, "ABCDE12345")
+            .unwrap()
+            .replace(DITTO, "/bin/cp -R")
+            .replace(CHOWN, "true")
+            .replace(crate::codesign::CODESIGN, "true");
+        let ok = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "{script}");
+        assert_eq!(std::fs::read_to_string(bundle.join("v")).unwrap(), "new");
+        assert_eq!(std::fs::read_dir(apps.path()).unwrap().count(), 1);
     }
 
     #[test]
