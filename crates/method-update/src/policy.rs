@@ -9,7 +9,9 @@
 //! - the state machine a window draws: idle, checking, downloading, ready,
 //!   installing, failed ([`Machine`]). An automatic check that fails says
 //!   nothing; a check the person asked for always answers;
-//! - [`Updater`], which ties these to the network and the bundle swap.
+//! - [`Updater`], which ties these to the network and the bundle swap, and
+//!   refuses an offer lower than the highest one it ever accepted
+//!   ([`crate::highwater`], kept beside the settings file).
 //!
 //! Nothing here starts a thread or a timer. The app's own timer (or a
 //! thread of its own) asks [`Updater::due`] now and then and runs
@@ -24,6 +26,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
+use crate::highwater::HighWater;
 use crate::install::{Admin, InstallError, Installed, Writability, install_app};
 use crate::target::Installer;
 use crate::transport::{Update, check, download};
@@ -380,6 +383,8 @@ pub struct Updater {
     whats_new: Mutex<bool>,
     /// Asked before every check: can an update go where the app is?
     location: Option<LocationProbe>,
+    /// The highest version a check offered and its download verified.
+    high_water: Mutex<HighWater>,
 }
 
 type LocationProbe = Box<dyn Fn() -> Writability + Send + Sync>;
@@ -419,7 +424,7 @@ impl Updater {
             current: current.to_string(),
             version,
             unavailable,
-            settings_file,
+            settings_file: settings_file.clone(),
             settings: Mutex::new(settings),
             may_write: Mutex::new(may_write),
             stored,
@@ -428,6 +433,12 @@ impl Updater {
             schedule: Mutex::new(Schedule::starting(launched)),
             whats_new: Mutex::new(due),
             location: None,
+            high_water: Mutex::new(
+                settings_file
+                    .as_deref()
+                    .map(|f| HighWater::at(HighWater::beside(f)))
+                    .unwrap_or_default(),
+            ),
         }
     }
 
@@ -584,7 +595,21 @@ impl Updater {
         {
             return lock(&self.machine).read_only();
         }
-        let found = check();
+        // An offer lower than the highest one ever accepted is refused
+        // before anything is downloaded.
+        let found = check().and_then(|u| match u {
+            Some(u) => match crate::manifest::parse_version(&u.version) {
+                Ok(v) => match lock(&self.high_water).admit(&v) {
+                    Ok(()) => Ok(Some(u)),
+                    Err(rollback) => Err(rollback.to_string()),
+                },
+                Err(_) => Err(format!(
+                    "The update's version {:?} is not semver.",
+                    u.version
+                )),
+            },
+            None => Ok(None),
+        });
         let version = match &found {
             Ok(u) => Ok(u.as_ref().map(|u| u.version.clone())),
             Err(e) => Err(e.clone()),
@@ -595,6 +620,12 @@ impl Updater {
         };
         match download(&update) {
             Ok(bytes) => {
+                // Signed and verified: now it counts as accepted.
+                if let Ok(v) = crate::manifest::parse_version(&update.version)
+                    && let Err(e) = lock(&self.high_water).record(&v)
+                {
+                    eprintln!("method-update: could not keep the highest version offered: {e}");
+                }
                 *lock(&self.pending) = Some((update, bytes));
                 lock(&self.machine).downloaded(Ok(()))
             }
@@ -963,6 +994,80 @@ mod tests {
             u.check_with(true, || Ok(None), |_| unreachable!()),
             Some(Said::Current)
         );
+    }
+
+    #[test]
+    fn an_offer_lower_than_the_highest_accepted_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("updates.json");
+        let mark = dir.path().join("updates.high-water.json");
+        let k = key();
+        // 1.4.0 offered and verified, but never installed.
+        let u = Updater::new(app(&k), "1.0.0", Some(file.clone()), Instant::now());
+        u.check_with(false, || Ok(Some(update("1.4.0"))), |_| Ok(vec![1]));
+        assert!(mark.is_file(), "kept beside the settings");
+        // A later run, still on 1.0.0, is offered the older 1.3.0.
+        let u = Updater::new(app(&k), "1.0.0", Some(file.clone()), Instant::now());
+        assert_eq!(
+            u.check_with(true, || Ok(Some(update("1.3.0"))), |_| unreachable!()),
+            Some(Said::Failed)
+        );
+        let st = u.status(None);
+        assert!(
+            st.message
+                .as_deref()
+                .unwrap()
+                .contains("older than version 1.4.0"),
+            "{st:?}"
+        );
+        u.dismiss();
+        // Automatic: refused silently, nothing downloaded.
+        assert_eq!(
+            u.check_with(false, || Ok(Some(update("1.3.0"))), |_| unreachable!()),
+            None
+        );
+        assert!(u.ready().is_none());
+        // The same release again, and anything newer, still pass.
+        u.check_with(false, || Ok(Some(update("1.4.0"))), |_| Ok(vec![1]));
+        assert_eq!(u.ready().map(|r| r.version).as_deref(), Some("1.4.0"));
+    }
+
+    #[test]
+    fn an_offer_whose_download_fails_is_not_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("updates.json");
+        let u = Updater::new(app(&key()), "1.0.0", Some(file.clone()), Instant::now());
+        // A tampered manifest announcing 99.0.0 fails its signature check.
+        u.check_with(false, || Ok(Some(update("99.0.0"))), |_| Err("bad".into()));
+        assert!(!dir.path().join("updates.high-water.json").exists());
+        u.check_with(false, || Ok(Some(update("1.1.0"))), |_| Ok(vec![1]));
+        assert!(u.ready().is_some(), "updates are not frozen");
+    }
+
+    #[test]
+    fn a_missing_or_damaged_high_water_file_is_no_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("updates.json");
+        let mark = dir.path().join("updates.high-water.json");
+        std::fs::write(&mark, "{\"highest\": \"nonsense").unwrap();
+        let u = Updater::new(app(&key()), "1.0.0", Some(file.clone()), Instant::now());
+        u.check_with(false, || Ok(Some(update("1.1.0"))), |_| Ok(vec![1]));
+        assert!(u.ready().is_some());
+        assert_eq!(
+            crate::highwater::HighWater::read(&mark),
+            Some(Version::new(1, 1, 0)),
+            "written over with a good mark"
+        );
+        // Missing: a fresh folder takes any newer offer.
+        let fresh = tempfile::tempdir().unwrap();
+        let u = Updater::new(
+            app(&key()),
+            "1.0.0",
+            Some(fresh.path().join("updates.json")),
+            Instant::now(),
+        );
+        u.check_with(false, || Ok(Some(update("1.0.1"))), |_| Ok(vec![1]));
+        assert!(u.ready().is_some());
     }
 
     #[test]

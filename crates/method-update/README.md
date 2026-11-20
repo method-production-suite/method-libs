@@ -22,6 +22,19 @@ suite's update behaviour built in.
   failure. When /Applications isn't writable, an administrator does the swap through
   osascript. An app that was renamed can name its old bundle, and the next update moves
   it to the new name, once.
+- **Code signature** (`method_update::codesign`): on a Mac, before the running bundle
+  moves, the unpacked update must pass `/usr/bin/codesign --verify --deep --strict`
+  against a requirement naming the running app's own team under Apple's anchor, and its
+  `TeamIdentifier` must be that team. The team is read from the running bundle
+  (`codesign -dv`), so no app sets it. A refusal is `InstallError::Signature` and the
+  installed app stays as it was. A running app that is unsigned, ad-hoc signed or signed
+  without a team (a development build, a test) skips the check and says so on stderr. A
+  running app codesign cannot read at all is skipped only when it has no
+  `Contents/_CodeSignature/CodeResources`; with that file it claims to be signed, and the
+  update is refused. When an administrator does the swap, root takes its own copy of the
+  new bundle, runs the same codesign requirement on that copy, and swaps in that copy, so
+  nothing changed after the first check can be installed. Windows and Linux check nothing
+  yet; `install_app_with` takes any `CodeSignature` tool.
 - **Restart**: starts `Installed::bundle` (the new path after a rename), reading
   `CFBundleExecutable` from the NEW Info.plist.
 - **Startup sweep**: puts back a bundle left hidden by an interrupted swap
@@ -36,6 +49,16 @@ suite's update behaviour built in.
   could be installed there: an app running from a read-only place (translocated, or
   opened from its disk image) is told "Move it to the Applications folder" and downloads
   nothing.
+- **Rollback protection** (`method_update::highwater`): the `Updater` remembers the
+  highest version a check offered whose download then passed its signature check, in
+  `updates.high-water.json` beside the settings file, and refuses any later offer lower
+  than it. The same version again, or a newer one, passes. A missing or damaged file is
+  no mark. Every app built on `Updater::new` (Method Launcher, Method Storyteller, Method
+  Budget) gets this with no change. An app that calls `transport::check` and `download`
+  itself (Method Reader) must call `HighWater::admit` on the offer after its check and
+  `HighWater::record` after its download verifies. For releases this means a pulled
+  release can only be replaced by a higher version: publishing an older one as latest is
+  refused by every copy that already downloaded the pulled one.
 
 No UI framework, no async runtime, no threads of its own: the app's timer or thread
 drives it. The updater never reads or checks the bundle identifier.
